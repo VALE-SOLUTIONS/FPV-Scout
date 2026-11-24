@@ -1,0 +1,1 @@
+#define CONFIG_CYD_C5_BAND_LINES 4

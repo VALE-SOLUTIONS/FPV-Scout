@@ -1,0 +1,19 @@
+menu "NM-CYD-C5 display"
+
+    config CYD_C5_TOUCH
+        bool "Use the XPT2046 touch panel (SPI MISO on GPIO2)"
+        default y
+        help
+            Disable when GPIO2 is needed for something else (C5VRX routes an
+            I/Q bit there): the SPI bus then has no MISO, touch CS (GPIO1) and
+            SD CS (GPIO10) are simply held high so neither chip ever drives
+            the line, and cyd_touch() always reports "not pressed".
+
+    config CYD_C5_BAND_LINES
+        int "Display lines per DMA band"
+        range 1 16
+        default 4
+        help
+            Size of the internal DMA pixel buffer (320 x lines x 2 bytes).
+
+endmenu

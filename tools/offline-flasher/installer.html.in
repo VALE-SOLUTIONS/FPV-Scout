@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' blob:; style-src 'unsafe-inline'; connect-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>FPV Scout Offline Installer</title>
+  <style>
+    :root { color-scheme: dark; font: 16px/1.5 system-ui, sans-serif; color: #eef3fa; background: #0a0e14; }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    main { max-width: 1056px; margin: auto; padding: clamp(24px, 6vw, 72px) clamp(16px, 4vw, 36px); }
+    header { border-bottom: 1px solid #293748; padding-bottom: 24px; margin-bottom: 24px; }
+    h1 { font-size: clamp(38px, 6vw, 62px); letter-spacing: -.055em; line-height: 1.05; margin: 0 0 8px; }
+    h2 { font-size: 20px; line-height: 1.25; margin: 0 0 14px; letter-spacing: -.02em; }
+    p { margin: 0 0 14px; }
+    .subtitle, .muted, footer, th { color: #a7b6c8; }
+    .subtitle { margin: 0; font-size: 17px; }
+    .layout { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+    .panel { background: #111923; border: 1px solid #293748; border-radius: 14px; padding: clamp(16px, 3vw, 24px); }
+    ol { margin: 0 0 22px; padding-left: 22px; }
+    li { padding-left: 4px; margin: 7px 0; }
+    li::marker { color: #61dfc6; font-weight: 700; }
+    button { font: inherit; font-weight: 650; min-height: 44px; padding: 8px 14px; border-radius: 8px; cursor: pointer; }
+    button.primary { background: #66e1c8; color: #0a2220; border: 1px solid #66e1c8; }
+    button.secondary { color: #eef3fa; background: #192738; border: 1px solid #36495d; }
+    button:hover:enabled { filter: brightness(1.12); }
+    button:disabled { cursor: default; opacity: .43; }
+    :focus-visible { outline: 2px solid #76edd8; outline-offset: 3px; }
+    [hidden] { display: none !important; }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .status { border-left: 3px solid #66e1c8; margin: 16px 0 0; padding: 9px 11px; background: #0d151e; border-radius: 0 7px 7px 0; }
+    .status[data-kind="error"] { border-color: #ffa47d; color: #ffcaad; }
+    .note { color: #a7b6c8; font-size: 14px; margin: 0 0 12px; }
+    .separator { border-top: 1px solid #293748; margin-top: 18px; padding-top: 16px; }
+    .progress { margin-top: 14px; }
+    progress { width: 100%; height: 10px; display: block; margin-top: 6px; accent-color: #66e1c8; }
+    dl { margin: 0 0 16px; }
+    dl div { display: flex; justify-content: space-between; gap: 12px; margin: 6px 0; }
+    dt { color: #a7b6c8; }
+    dd { text-align: right; margin: 0; overflow-wrap: anywhere; }
+    table { border-collapse: collapse; width: 100%; font-size: 14px; }
+    th, td { text-align: left; padding: 7px 0; border-bottom: 1px solid #293748; }
+    th:last-child, td:last-child { text-align: right; }
+    code, pre { font: .9em/1.55 "Cascadia Mono", Consolas, monospace; }
+    details { margin-top: 16px; }
+    summary { cursor: pointer; font-weight: 600; }
+    pre { color: #b4c8dc; margin: 12px 0 0; max-height: 235px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+    footer { padding-top: 4px; font-size: 13px; }
+    @media (max-width: 680px) { .layout { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>FPV Scout</h1>
+      <p class="subtitle">Offline firmware installer for the RockBase NM-CYD-C5</p>
+    </header>
+    <div class="layout">
+      <section class="panel" aria-labelledby="install-heading">
+        <h2 id="install-heading">Connect your CYD</h2>
+        <ol>
+          <li>Connect the CYD’s native ESP32 USB-C port with a data cable. Close any open serial monitor.</li>
+          <li>Choose <strong>Connect board</strong> and select the Espressif USB serial device. The installer will reboot the board into download mode.</li>
+        </ol>
+        <div class="actions">
+          <button id="connect" class="primary" disabled>Connect board</button>
+          <button id="disconnect" class="secondary" hidden>Disconnect</button>
+        </div>
+        <p class="status" id="status" role="status" aria-live="polite">Loading the offline flasher…</p>
+        <details id="recovery">
+          <summary>Manual connection</summary>
+          <p class="note">Hold <strong>BOOT</strong>, tap <strong>RESET</strong>, then release <strong>BOOT</strong>. The screen may go blank.</p>
+          <button id="connect-manual" class="secondary" disabled>Connect in download mode</button>
+        </details>
+        <div class="separator" id="operations" hidden>
+          <p class="note">Install only on the RockBase NM-CYD-C5. Check the model printed on the board. The USB check verifies the chip and flash size. Save a full backup to restore the factory firmware later.</p>
+          <div class="actions">
+            <button id="backup" class="secondary" disabled>Save 16 MB backup</button>
+            <button id="install" class="primary" disabled>Install FPV Scout</button>
+          </div>
+        </div>
+        <div id="progress-wrap" class="progress" hidden>
+          <label id="progress-label" for="progress"></label>
+          <progress id="progress" max="100" value="0"></progress>
+        </div>
+      </section>
+      <section class="panel" aria-labelledby="firmware-heading">
+        <h2 id="firmware-heading">Bundled firmware</h2>
+        <dl>
+          <div><dt>Release</dt><dd>@@VERSION@@</dd></div>
+          <div><dt>Target</dt><dd>ESP32-C5 · 16 MB flash</dd></div>
+        </dl>
+        <table aria-label="Flash layout">
+          <thead><tr><th scope="col">Image</th><th scope="col">Flash address</th></tr></thead>
+          <tbody>@@IMAGES@@</tbody>
+        </table>
+        <details id="log-panel">
+          <summary>Serial log</summary>
+          <pre id="log" tabindex="0"></pre>
+        </details>
+      </section>
+    </div>
+    <footer>
+      <details>
+        <summary>Licenses and source</summary>
+        <p>See the <a href="https://github.com/VALE-SOLUTIONS/FPV-Scout/tree/@@SOURCE_TAG@@">FPV Scout source and notices</a>. The firmware is GPL-3.0-only. Bundled installer dependencies retain their license notices below.</p>
+        <pre>@@LICENSES@@</pre>
+      </details>
+    </footer>
+  </main>
+  <script id="manifest" type="application/json">@@MANIFEST@@</script>
+  <script id="esptool-bundle" type="text/plain">@@ESPTOOL@@</script>
+  <script>@@MD5@@</script>
+  <script type="module">
+    const get = id => document.getElementById(id);
+    const manifest = JSON.parse(get("manifest").textContent);
+    const serial = navigator.serial;
+    const sizeMiB = 1024 * 1024;
+    let tools;
+    let session;
+    let busy = false;
+    let workingWithFlash = false;
+
+    function status(message, error = false) {
+      get("status").textContent = message;
+      get("status").dataset.kind = error ? "error" : "info";
+    }
+
+    function log(message) {
+      const output = get("log");
+      output.textContent += message;
+      output.scrollTop = output.scrollHeight;
+    }
+
+    function controls() {
+      get("connect").disabled = !tools || busy || Boolean(session);
+      get("connect-manual").disabled = get("connect").disabled;
+      get("disconnect").hidden = !session;
+      get("disconnect").disabled = busy;
+      get("operations").hidden = !session;
+      get("backup").disabled = busy || !session;
+      get("install").disabled = busy || !session;
+    }
+
+    function progress(message, fraction) {
+      get("progress-wrap").hidden = false;
+      get("progress-label").textContent = message;
+      if (fraction === undefined) get("progress").removeAttribute("value");
+      else get("progress").value = Math.round(fraction * 100);
+    }
+
+    function hex(bytes) {
+      return Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
+    }
+
+    function md5(bytes) {
+      return SparkMD5.ArrayBuffer.hash(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+    }
+
+    async function close(transport = session?.transport) {
+      session = undefined;
+      try {
+        await transport?.disconnect();
+      } catch (error) {
+        log(`Port close: ${error.message}\n`);
+      }
+    }
+
+    async function connect(mode) {
+      let transport;
+      let reachedBootloader = false;
+      busy = true;
+      controls();
+      get("progress-wrap").hidden = true;
+      get("log").textContent = "";
+      status("Select the Espressif USB serial device.");
+      try {
+        const port = await serial.requestPort({ filters: [{ usbVendorId: 0x303a, usbProductId: 0x1001 }] });
+        transport = new tools.Transport(port);
+        const loader = new tools.ESPLoader({ transport, baudrate: 115200, terminal: {
+          clean: () => { get("log").textContent = ""; },
+          writeLine: line => log(`${line}\n`),
+          write: log,
+        } });
+        status(mode === "usb_reset" ? "Rebooting the CYD into download mode…" : "Connecting to the CYD bootloader…");
+        const description = await loader.main(mode);
+        reachedBootloader = true;
+        if (loader.chip.CHIP_NAME !== "ESP32-C5") throw new Error("This installer requires an ESP32-C5.");
+        const security = await loader.getSecurityInfo();
+        if (security.parsedFlags.SECURE_BOOT_EN || security.parsedFlags.SECURE_DOWNLOAD_ENABLE || security.flashCryptCnt) {
+          throw new Error("The board has flash security enabled. The stock installer requires standard download mode and unencrypted flash.");
+        }
+        if (!loader.IS_STUB || await loader.detectFlashSize() !== "16MB") {
+          throw new Error("The installer requires the ESP32-C5 flash stub and a detected 16 MB flash chip.");
+        }
+        session = { loader, transport, port };
+        status(`${description} connected · 16 MB flash detected.`);
+      } catch (error) {
+        await close(transport);
+        if (!transport && error.name === "NotFoundError") status("No serial port selected.");
+        else {
+          log(`Connection failed: ${error.message}\n`);
+          if (reachedBootloader) {
+            status(error.message, true);
+          } else {
+            get("recovery").open = true;
+            status("Could not reach the bootloader. Check the native USB port, then retry or use Manual connection below.", true);
+          }
+        }
+      } finally {
+        busy = false;
+        controls();
+      }
+    }
+
+    async function writeFirmware({ loader }) {
+      progress("Checking the bundled firmware", 0);
+      const images = [];
+      for (const image of manifest.images) {
+        const data = Uint8Array.from(atob(image.base64), byte => byte.charCodeAt(0));
+        const checksum = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", data)));
+        if (data.length !== image.size || checksum !== image.sha256) {
+          throw new Error(`The bundled ${image.name} failed its integrity check.`);
+        }
+        images.push({ data, address: image.address });
+      }
+      status("Installing and verifying firmware. Keep the USB cable connected.");
+      await loader.writeFlash({
+        fileArray: images,
+        flashSize: "keep", flashMode: "keep", flashFreq: "keep",
+        compress: true, eraseAll: false, calculateMD5Hash: md5,
+        reportProgress(index, written, total) {
+          progress(`Writing ${manifest.images[index].name} · ${index + 1} of ${images.length}`,
+            (index + written / total) / images.length);
+        },
+      });
+      progress("All three images verified", 1);
+      await close();
+      status("FPV Scout installed. Press RESET on the CYD to start it.");
+    }
+
+    async function saveBackup({ loader, transport }) {
+      const total = 16 * sizeMiB;
+      const parts = [];
+      status("Reading and verifying the stock flash. Keep the USB cable connected.");
+      progress("Backing up flash", 0);
+      for (let offset = 0; offset < total; offset += sizeMiB) {
+        const part = await loader.readFlash(offset, sizeMiB, (_packet, bytes) => {
+          progress(`Backing up flash · ${Math.floor((offset + bytes) / sizeMiB)} of 16 MB`, (offset + bytes) / total);
+        });
+        // The ROM stub sends an MD5 packet after each read. ESPLoader.readFlash leaves it queued.
+        const digest = await transport.read(5000);
+        if (part.length !== sizeMiB || digest.length !== 16 || hex(digest) !== md5(part)) {
+          throw new Error(`Backup verification failed at flash offset 0x${offset.toString(16)}.`);
+        }
+        parts.push(part);
+      }
+      const url = URL.createObjectURL(new Blob(parts, { type: "application/octet-stream" }));
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `nm-cyd-c5-backup-${new Date().toISOString().slice(0, 10)}.bin`;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+      progress("16 MB backed up and verified", 1);
+      status("Verified backup sent to your browser’s downloads. Keep the file private.");
+    }
+
+    async function flashOperation(operation, name) {
+      if (!session || busy) return;
+      busy = workingWithFlash = true;
+      controls();
+      try {
+        await operation(session);
+      } catch (error) {
+        log(`${name} failed: ${error.message}\n`);
+        get("log-panel").open = true;
+        await close();
+        get("progress-wrap").hidden = true;
+        status(`${name} stopped. Select Connect board to retry.`, true);
+      } finally {
+        busy = workingWithFlash = false;
+        controls();
+      }
+    }
+
+    get("connect").addEventListener("click", () => connect("usb_reset"));
+    get("connect-manual").addEventListener("click", () => connect("no_reset"));
+    get("disconnect").addEventListener("click", async () => {
+      busy = true;
+      controls();
+      await close();
+      busy = false;
+      controls();
+      get("progress-wrap").hidden = true;
+      status("Disconnected. Press RESET on the CYD to boot its firmware.");
+    });
+    get("backup").addEventListener("click", () => flashOperation(saveBackup, "Backup"));
+    get("install").addEventListener("click", () => flashOperation(writeFirmware, "Installation"));
+    window.addEventListener("beforeunload", event => {
+      if (workingWithFlash) {
+        event.preventDefault();
+        event.returnValue = true;
+      }
+    });
+
+    if (!serial || !window.isSecureContext) {
+      status("Open this downloaded HTML file in desktop Chrome or Microsoft Edge to enable USB serial access.", true);
+    } else {
+      serial.addEventListener("disconnect", async event => {
+        if (busy || event.target !== session?.port) return;
+        await close();
+        controls();
+        get("progress-wrap").hidden = true;
+        status("The CYD was disconnected. Reconnect it to continue.", true);
+      });
+      const url = URL.createObjectURL(new Blob([get("esptool-bundle").textContent], { type: "text/javascript" }));
+      try {
+        tools = await import(url);
+        status("Ready to connect. The installer will enter download mode over USB.");
+      } catch (error) {
+        log(`Flasher load failed: ${error.message}\n`);
+        status("The embedded flasher could not load. Open a fresh copy of the installer in Chrome or Edge.", true);
+      } finally {
+        URL.revokeObjectURL(url);
+        controls();
+      }
+    }
+  </script>
+</body>
+</html>

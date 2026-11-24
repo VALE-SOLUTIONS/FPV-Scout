@@ -1,0 +1,6 @@
+# FPV Scout: one factory app, no OTA switching or C5VRX slot.
+# Retain the old NVS address for the board's touch calibration.
+# Name, Type, SubType, Offset, Size
+nvs, data, nvs, 0x9000, 0x6000,
+phy_init, data, phy, 0x11000, 0x1000,
+scout, app, factory, 0x20000, 0x200000,
