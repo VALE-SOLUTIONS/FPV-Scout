@@ -13,6 +13,8 @@ Standalone receive-only **FPV link scanning** on the RockBase NM-CYD-C5, with se
 
 [Download the offline installer from the latest release](https://github.com/VALE-SOLUTIONS/FPV-Scout/releases/latest/download/FPV-Scout-Offline-Flasher.html). Open the HTML in desktop Chrome or Edge and connect the native USB-C port on the RockBase NM-CYD-C5. **Connect board** enters download mode automatically.
 
+To try the controls before installing, [download the offline simulator](https://github.com/VALE-SOLUTIONS/FPV-Scout/releases/download/v1.19.0/FPV-Scout-Offline-Simulator.html) and open it from disk. It runs in your browser with demo signals and needs no CYD. [Simulator guide](https://github.com/VALE-SOLUTIONS/FPV-Scout/wiki/Offline-Simulator)
+
 ## Features
 
 - **Scanning main menu** opens by default and cycles through analog video, digital video, control links and Remote ID. Tap a result to open its dedicated scanner.

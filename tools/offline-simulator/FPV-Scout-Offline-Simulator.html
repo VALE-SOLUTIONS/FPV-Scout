@@ -1,0 +1,575 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>FPV Scout Offline Simulator</title>
+  <style>
+    :root { color-scheme: dark; font: 16px/1.5 system-ui, sans-serif; color: #eef3fa; background: #0a0e14; --mint: #66e1c8; --muted: #a7b6c8; }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    main { max-width: 1090px; margin: auto; padding: clamp(18px, 4.5vw, 52px) clamp(12px, 3.3vw, 36px); }
+    header { border-bottom: 1px solid #293748; padding-bottom: 19px; margin-bottom: 22px; }
+    h1 { font-size: clamp(32px, 5.4vw, 56px); letter-spacing: -.055em; line-height: 1.08; margin: 0 0 8px; }
+    p { margin: 0; }
+    .sub, .hint, small { color: var(--muted); }
+    .layout { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 17px; align-items: start; }
+    .panel { background: #111923; border: 1px solid #293748; border-radius: 14px; padding: clamp(13px, 2.5vw, 22px); }
+    .bench h2 { font-size: 20px; margin: 0 0 6px; }
+    button, select, input { font: inherit; }
+    button, select, input[type=number] { border: 1px solid #394b5f; border-radius: 8px; background: #192738; color: inherit; min-height: 38px; }
+    button { padding: 5px 10px; cursor: pointer; }
+    button:hover:enabled { filter: brightness(1.19); }
+    button:disabled { opacity: .55; cursor: default; }
+    button.primary { background: var(--mint); color: #082521; border-color: var(--mint); font-weight: 650; }
+    :focus-visible { outline: 2px solid var(--mint); outline-offset: 2px; }
+    [hidden] { display: none !important; }
+    .device-panel { padding: clamp(10px, 2vw, 20px); }
+    .frame { position: relative; margin: auto; width: min(100%, 350px); border: 7px solid #222c38; border-radius: 14px; box-shadow: 0 0 0 1px #3a4756; container-type: inline-size; background: #0a0e12; }
+    .frame[data-orientation=Landscape] { width: 100%; }
+    .led { position: absolute; z-index: 3; top: -5px; right: 13px; width: 8px; height: 3px; border-radius: 4px; background: #573235; }
+    .led[data-on=true] { background: #e7646c; box-shadow: 0 0 6px #ee646a80; }
+    .screen { aspect-ratio: 3 / 4; min-height: 0; overflow: hidden; color: #eaf1fc; font-size: clamp(12px, 4.4cqw, 16px); border-radius: 6px; display: flex; flex-direction: column; }
+    [data-orientation=Landscape] .screen { aspect-ratio: 4 / 3; font-size: clamp(12px, 3.4cqw, 16px); }
+    [data-wallpaper=true] { background: radial-gradient(ellipse at 15% 100%, #235366, transparent 62%), linear-gradient(132deg, #101925 35%, #213b4b 100%); }
+    .screen button, .screen select, .screen input { font-size: inherit; line-height: 1.16; min-height: 0; border-radius: 6px; }
+    .screen button { background: #172531; border-color: transparent; }
+    .screen button.primary { background: #46d3b9; color: #072523; }
+    .bar { padding: 2.4% 4.2%; display: flex; align-items: center; gap: 7px; min-height: 10%; flex-shrink: 0; }
+    .bar h2 { min-width: 0; margin: 0; font-size: 1.14em; line-height: 1.1; }
+    .bar .badge { margin-left: auto; color: var(--mint); font-size: .76em; white-space: nowrap; }
+    .content { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: .36em; padding: 0 4.2% 3%; overflow: auto; }
+    .stack { display: grid; gap: .35em; }
+    .pair { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: .35em; }
+    .pick, .row { width: 100%; text-align: left; padding: .38em .58em; }
+    .row { display: flex; align-items: center; justify-content: space-between; gap: .45em; }
+    .row strong { font-weight: 550; }
+    .row span, .pick span { color: #a9bfd0; }
+    .pick span { display: block; font-size: .78em; margin-top: .16em; }
+    .reading { font-size: .88em; color: #a9bfd0; }
+    .accent { color: var(--mint); }
+    .actions { display: flex; gap: .38em; margin-top: auto; }
+    .actions > * { flex: 1; padding: .55em .26em; }
+    .graph, .video { position: relative; padding: 0; overflow: hidden; width: 100%; display: block; }
+    .screen button.graph, .screen button.video { background: #070b0f; }
+    .graph { border: 1px solid #203340; height: 3.3em; flex-shrink: 0; }
+    .graph.large { min-height: 4.6em; flex: 1; }
+    canvas { width: 100%; height: 100%; display: block; }
+    .axis { display: flex; justify-content: space-between; font: .75em ui-monospace, monospace; color: #a9bfd0; }
+    .video { flex: 1; min-height: 3.4em; border: 0; }
+    .video canvas { object-fit: contain; }
+    .video .overlay { position: absolute; top: 5%; left: 3%; right: 3%; display: flex; justify-content: space-between; text-align: left; font: .75em ui-monospace, monospace; color: white; text-shadow: 0 1px 3px #000, 0 0 4px #000; pointer-events: none; }
+    .empty-video { position: absolute; inset: 0; display: grid; place-items: center; color: #a9bfd0; }
+    .full { flex: 1; min-height: 0; display: flex; }
+    .screen form { display: grid; gap: .45em; }
+    .screen input, .screen select { width: 100%; padding: .36em .42em; }
+    .screen dl { display: grid; grid-template-columns: 1fr auto; gap: .3em; margin: .35em 0; font-size: .88em; }
+    .screen dd { margin: 0; text-align: right; }
+    .sources { display: grid; gap: 9px; margin: 16px 0; }
+    .source { background: #0d151e; border: 1px solid #253445; border-radius: 8px; padding: 8px 10px; }
+    .source label { display: flex; gap: 7px; align-items: center; cursor: pointer; }
+    .source small { display: block; }
+    input { accent-color: var(--mint); }
+    .source .quality { display: grid; grid-template-columns: 1fr auto; gap: 3px; margin-top: 10px; }
+    .quality input { width: 100%; grid-column: 1 / -1; margin: 0; }
+    #restart { width: 100%; }
+    .bench .hint { font-size: 14px; }
+    .device-note { text-align: center; font-size: 13px; color: var(--muted); margin-top: 11px; }
+    @media (max-width: 700px) { .layout { grid-template-columns: 1fr; } }
+    @media (prefers-reduced-motion: reduce) { .led { box-shadow: none !important; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>FPV Scout Offline Simulator</h1>
+    <p class="sub">Explore the 1.19.0 CYD interface with simulated signals. Runs entirely in this browser.</p>
+  </header>
+  <div class="layout">
+    <section class="panel device-panel" aria-label="Simulated CYD">
+      <div class="frame" id="frame">
+        <span class="led" id="led" aria-hidden="true"></span>
+        <div class="screen" id="screen"></div>
+      </div>
+      <p class="device-note">RockBase NM-CYD-C5 · <span id="orientation-note"></span></p>
+    </section>
+    <aside class="panel bench" aria-labelledby="sources-title">
+      <h2 id="sources-title">Bench signals</h2>
+      <p class="hint">Switch demo sources on or off. Enable the second analog source and lower R4 quality to try a channel recheck.</p>
+      <div class="sources" id="sources"></div>
+      <button id="restart" type="button">Restart simulated CYD</button>
+      <p class="device-note">Signal levels and timing are illustrative.</p>
+    </aside>
+  </div>
+</main>
+<script>
+  "use strict";
+  const $ = id => document.getElementById(id);
+  const screen = $("screen");
+  const bands = {
+    R: [5658, 5695, 5732, 5769, 5806, 5843, 5880, 5917],
+    A: [5865, 5845, 5825, 5805, 5785, 5765, 5745, 5725],
+    B: [5733, 5752, 5771, 5790, 5809, 5828, 5847, 5866],
+    E: [5705, 5685, 5665, 5645, 5885, 5905, 5925, 5945],
+    F: [5740, 5760, 5780, 5800, 5820, 5840, 5860, 5880],
+    L: [5362, 5399, 5436, 5473, 5510, 5547, 5584, 5621]
+  };
+  const presets = Object.entries(bands).flatMap(([band, values]) =>
+    values.map((mhz, index) => ({ band, mhz, channel: band + (index + 1) }))
+  );
+  const examples = {
+    r4: { kind: "analog", label: "Analog Video", channel: "R4", mhz: 5769, level: 44, unit: "dB rel.", quality: 96, standard: "PAL" },
+    b5: { kind: "analog", label: "Analog Video", channel: "B5", mhz: 5809, level: 39, unit: "dB rel.", quality: 94, standard: "NTSC" },
+    digital: { kind: "digital", label: "Digital Video", mhz: 5843, level: 28, unit: "dB rel." },
+    control: { kind: "control", label: "Control Links", mhz: 2446, level: -53, unit: "dBFS", quality: 88 },
+    rid: { kind: "rid", label: "Remote ID", level: -61, unit: "dBm" }
+  };
+  const titles = { menu: "FPV Scout", scan: "Video Link Scanner", spectrum: "Spectrum", settings: "Settings", control: "Control Link Scanner", rid: "RemoteID Check", log: "Signal Log", bench: "Composite Bench", calibration: "Signal Calibration", analog: "Analog Video", digital: "Digital Video" };
+  const startPages = { menu: "Main Menu", scan: "Video Scan", control: "Control Links", rid: "Remote ID", spectrum: "Spectrum", log: "Signal Log", settings: "Settings" };
+  const tools = { analog: "Analog Video", digital: "Digital Video", control: "Control Links", rid: "Remote ID" };
+  const phases = ["analog", "digital", "control", "rid"];
+  const patterns = ["Black", "Bars", "Ramp", "Checkerboard", "Moving bar"];
+  const key = "fpv-scout-simulator-1.19";
+  function load() {
+    try { return JSON.parse(localStorage.getItem(key)) || {}; }
+    catch { return {}; }
+  }
+  const saved = load();
+  const settings = {
+    orientation: saved.orientation === "Landscape" ? "Landscape" : "Portrait",
+    startup: Object.hasOwn(startPages, saved.startup) ? saved.startup : "menu",
+    rescan: saved.rescan !== false,
+    wallpaper: ["Main", "All", "Off"].includes(saved.wallpaper) ? saved.wallpaper : "Off"
+  };
+  const references = Object.fromEntries(phases
+    .filter(kind => Object.hasOwn(examples, saved.references?.[kind]) && examples[saved.references[kind]].kind === kind)
+    .map(kind => [kind, saved.references[kind]]));
+  const log = Array.isArray(saved.log) ? saved.log.filter(entry => entry && Object.hasOwn(examples, entry.id)
+    && [entry.first, entry.last, entry.lost].every(Number.isFinite)).slice(0, 32) : [];
+  function persist() {
+    try { localStorage.setItem(key, JSON.stringify({ ...settings, references, log })); }
+    catch { /* The session remains usable when storage is blocked. */ }
+  }
+  const state = {
+    page: settings.startup, phase: 0, mode: "auto", tune: presets[0], status: "Scanning",
+    lock: null, skip: null, deadline: 0, lostAt: 0, lowAt: 0, recheckAt: 0, lastCheck: 0,
+    waterfall: false, fullscreen: false, editor: "", graph24: false, hold: false,
+    calibration: null, logItem: null, notice: "", pattern: 0, format: "NTSC", ledUntil: 0,
+    seen: {}, on: { r4: true, b5: false, digital: false, control: false, rid: false }
+  };
+  const activeIds = kind => Object.keys(examples).filter(id => state.on[id] && examples[id].kind === kind);
+  const strength = id => examples[id].level + " " + examples[id].unit;
+  const caption = id => examples[id].channel ? examples[id].channel + " · " + examples[id].mhz + " MHz"
+    : id === "rid" ? "Bluetooth · SIM-DEMO-01" : examples[id].mhz + " MHz";
+  const button = (label, action, extra = "") => `<button type="button" data-action="${action}" ${extra}>${label}</button>`;
+  const row = (label, value, action) => button(`<strong>${label}</strong><span>${value}</span>`, action, 'class="row"');
+  const graph = (mode, large = false, action = "") => {
+    const classes = "graph" + (large ? " large" : "");
+    const canvas = `<canvas aria-hidden="true" width="256" height="84" data-graph="${mode}"></canvas>`;
+    return action ? button(canvas, action, `class="${classes}" aria-label="Switch to ${mode === "waterfall" ? "sweep" : "waterfall"}"`)
+      : `<div class="${classes}" role="img" aria-label="${mode === "waterfall" ? "Waterfall" : "Spectrum sweep"}">${canvas}</div>`;
+  };
+  const axes = (lo, mid, hi) => `<div class="axis"><span>${lo}</span><span>${mid}</span><span>${hi}</span></div>`;
+  const bandAxis = is24 => is24 ? axes("2.400", "2.445 GHz", "2.490") : axes("5.362", "5.8 GHz", "5.945");
+  function observe(id) {
+    state.seen[examples[id].kind] = id;
+    const now = Date.now();
+    const entry = log.find(item => item.id === id);
+    if (entry) Object.assign(entry, { last: now, lost: 0 });
+    else log.unshift({ id, first: now, last: now, lost: 0 });
+    if (log.length > 32) log.pop();
+    persist();
+  }
+  function startScan(skip = null) {
+    Object.assign(state, {
+      mode: "auto", lock: null, skip, tune: presets[0], status: "Scanning",
+      deadline: performance.now() + 740, lostAt: 0, lowAt: 0, recheckAt: 0, lastCheck: 0
+    });
+  }
+  function open(page, kind = "") {
+    Object.assign(state, { page, fullscreen: false, editor: "", notice: "", logItem: null, hold: false });
+    if (page === "scan") {
+      startScan();
+      if (kind === "digital" && state.on.digital) {
+        Object.assign(state, { mode: "manual", tune: { mhz: examples.digital.mhz, channel: "R6" }, status: "Digital signal" });
+        observe("digital");
+      }
+    }
+    if (page === "menu") state.phase = 0;
+    render();
+  }
+  function tune(channel) {
+    const live = activeIds("analog").find(id => examples[id].mhz === channel.mhz);
+    state.tune = channel;
+    state.lock = live || null;
+    state.status = live ? "Locked" : state.on.digital && channel.mhz === examples.digital.mhz ? "Digital signal" : "Waiting for sync";
+    if (live) observe(live);
+    else if (state.status === "Digital signal") observe("digital");
+  }
+  function menu() {
+    const cards = phases.map(kind => {
+      const id = state.seen[kind];
+      return button(`${tools[kind]}<span data-result="${kind}">${id && state.on[id] ? caption(id) : "Listening…"}</span>`, "view-" + kind, 'class="pick"');
+    });
+    return `<p class="reading" id="menu-phase">Checking ${tools[phases[state.phase]].toLowerCase()}…</p><div class="stack">${cards.join("")}</div>
+      <div class="pair">${button("Spectrum", "open-spectrum")}${button("Settings", "open-settings")}
+      ${button("Signal Log", "open-log")}${button("Composite", "open-bench")}</div>`;
+  }
+  function video() {
+    const id = state.lock;
+    const signal = examples[id];
+    const picture = `<canvas width="320" height="184" data-picture="analog" ${id ? "" : "hidden"}></canvas>`;
+    const overlay = signal ? `<span class="overlay"><span>${signal.channel} · ${signal.mhz} MHz<br>${signal.standard}</span><span>RSSI ${signal.level} dB<br>LQ ${state.on[id] ? signal.quality : 0}%</span></span>` : "";
+    const waiting = state.status === "Digital signal" ? "Wideband activity · video unavailable" : "Waiting for analog video";
+    return button(picture + overlay + (id ? "" : `<span class="empty-video">${waiting}</span>`), "fullscreen",
+      `class="video" aria-label="${state.fullscreen ? "Exit" : "Open"} fullscreen video" ${id ? "" : "disabled"}`);
+  }
+  function scanner() {
+    if (state.editor) {
+      const options = presets.map(p => `<option value="${p.channel}" ${p.channel === state.tune.channel ? "selected" : ""}>${p.channel} · ${p.mhz} MHz</option>`).join("");
+      const field = state.editor === "preset" ? `<label>Band and channel<select id="preset">${options}</select></label>`
+        : `<label>Frequency (MHz)<input id="frequency" type="number" min="5362" max="5945" step="1" required value="${state.tune.mhz}"></label>`;
+      return `<form id="tune">${field}<div class="pair">${button(state.editor === "preset" ? "Direct frequency" : "Band / channel", "switch-editor")}
+        <button type="submit" class="primary">Tune</button></div></form>`;
+    }
+    const action = state.mode === "manual" ? button("Channel", "edit-channel")
+      : state.lock ? button("Continue", "continue") : button("Rescan", "rescan");
+    return graph(state.waterfall ? "waterfall" : "sweep", false, "switch-graph") + bandAxis(false)
+      + `<p class="reading channel-readout">${state.tune.channel} · ${state.tune.mhz} MHz</p>` + video()
+      + `<div class="actions">${button(state.mode === "auto" ? "Manual" : "Autoscan", "mode", 'class="primary"')}${action}</div>`;
+  }
+  function config() {
+    return row("Auto rescan", settings.rescan ? "On" : "Off", "auto-rescan")
+      + row("Orientation", settings.orientation, "orientation") + button("Signal Calibration", "open-calibration")
+      + row("Wallpaper", settings.wallpaper, "wallpaper") + button("Test LED", "test-led")
+      + row("Start page", startPages[settings.startup], "startup")
+      + (state.notice ? `<p class="reading" role="status">${state.notice}</p>` : "");
+  }
+  function calibration() {
+    const cal = state.calibration;
+    if (!cal) return phases.map(kind => button(tools[kind], "cal-" + kind)).join("");
+    const rid = cal.kind === "rid";
+    const reference = references[cal.kind];
+    const result = cal.result ? `<p class="accent">Review reference</p><p>${caption(cal.result)}</p>
+      <p class="reading">${cal.kind === "analog" ? `${examples[cal.result].standard} · LQ ${examples[cal.result].quality}% · Picture 98%` : strength(cal.result)}</p>` : "";
+    const steps = {
+      setup: [rid ? "Turn on the demo beacon and listen for Bluetooth." : "Switch off the selected demo source before measuring the quiet band.", rid ? "Listen" : "Measure baseline"],
+      ready: ["Quiet floor −32 dB rel. Turn on a demo source and check it.", "Check signal"],
+      listening: [state.on.rid ? "Bluetooth observed · SIM-DEMO-01" : "Listening for the simulated beacon…", "Use results"],
+      review: ["", "Save reference"],
+      saved: ["Reference saved", "Run again"]
+    };
+    const [message, label] = steps[cal.stage];
+    return (result || "") + (message ? `<p class="reading">${message}</p>` : "") +
+      (reference ? `<p class="reading">Saved reference · ${caption(reference)}</p>` : "") +
+      (state.notice ? `<p class="reading" role="status">${state.notice}</p>` : "") +
+      `<div class="actions">${button(label, "cal-next", 'class="primary"')}</div>`;
+  }
+  const time = moment => moment ? new Date(moment).toLocaleTimeString() : "—";
+  function signalLog() {
+    const entry = log.find(item => item.id === state.logItem);
+    if (entry) {
+      const id = entry.id;
+      const sample = examples[id];
+      return `<p class="accent">${sample.label}</p><dl>
+        <dt>Frequency / band</dt><dd>${sample.mhz ? caption(id) : "2.4 GHz BLE"}</dd>
+        <dt>RSSI</dt><dd>${strength(id)}</dd><dt>First seen</dt><dd>${time(entry.first)}</dd>
+        <dt>Last seen</dt><dd>${time(entry.last)}</dd><dt>Lost</dt><dd>${time(entry.lost)}</dd></dl>`;
+    }
+    const rows = log.map(item => button(`<strong>${examples[item.id].label}</strong><span>${caption(item.id)}</span>`, "log-" + item.id, 'class="pick"')).join("");
+    const disabled = log.length ? "" : "disabled";
+    return (rows || '<p class="reading">No detections yet.</p>') + (state.notice ? `<p class="reading" role="status">${state.notice}</p>` : "") +
+      `<div class="actions">${button("Save CSV", "save-log", disabled)}${button("Clear", "clear-log", disabled)}</div>`;
+  }
+  function render() {
+    const page = state.page;
+    const current = document.activeElement;
+    const focused = screen.contains(current) ? { action: current.dataset.action, id: current.id } : null;
+    $("frame").dataset.orientation = settings.orientation;
+    $("orientation-note").textContent = settings.orientation;
+    screen.dataset.wallpaper = settings.wallpaper === "All" || (settings.wallpaper === "Main" && page === "menu");
+    if (page === "scan" && state.fullscreen && state.lock) {
+      screen.innerHTML = `<div class="full">${video()}</div>`;
+    } else {
+      const title = page === "calibration" && state.calibration ? tools[state.calibration.kind] : titles[page];
+      const badge = page === "scan" && !state.editor ? `<span class="badge">${state.status}</span>` : "";
+      const header = `<div class="bar">${page === "menu" ? "" : button("Back", "back")}<h2>${title}</h2>${badge}</div>`;
+      const pages = {
+        menu, scan: scanner, settings: config, calibration, log: signalLog,
+        spectrum: () => graph("sweep", true) + graph("waterfall", true) + bandAxis(state.graph24)
+          + `<div class="actions">${button(state.hold ? "Resume" : "Hold", "hold")}${button(state.graph24 ? "5.8 GHz" : "2.4 GHz", "spectrum-band")}</div>`,
+        control: () => `<p>${state.on.control ? "Likely ELRS" : "ExpressLRS 2.4 GHz · Listening"}</p>
+          <p class="reading">${state.on.control ? "84% · RSSI −53 dBFS · LQ 88%" : "No matching waveform"}</p>`
+          + graph("waterfall", true) + bandAxis(true) + "<p>DJI OcuSync · Listening</p>",
+        rid: () => state.on.rid ? `<p class="accent">SIM-DEMO-01</p><p class="reading">Bluetooth · −61 dBm</p><p class="reading">Listening on Wi-Fi and Bluetooth</p>`
+          : '<p class="reading">Listening for Remote ID over Wi-Fi and Bluetooth…</p>',
+        bench: () => `<p class="reading">${state.format} · ${patterns[state.pattern]}</p>
+          <div class="video"><canvas width="320" height="184" data-picture="bench" aria-label="Composite test pattern"></canvas></div>
+          <div class="actions">${button(state.format, "format")}${button("Next pattern", "pattern")}</div>`
+      };
+      screen.innerHTML = header + `<div class="content">${pages[page]()}</div>`;
+    }
+    if (focused?.action) screen.querySelector(`[data-action="${focused.action}"]`)?.focus({ preventScroll: true });
+    else if (focused?.id) $(focused.id)?.focus({ preventScroll: true });
+    paint();
+  }
+  function frequencyX(mhz, is24) {
+    if (is24) return (mhz - 2400) / 90;
+    return mhz <= 5800 ? (mhz - 5362) / 876 : .5 + (mhz - 5800) / 290;
+  }
+  let frame = 0;
+  function paint() {
+    const is24 = state.page === "control" || (state.page === "spectrum" && state.graph24);
+    const signals = (is24 ? ["control", "rid"] : ["r4", "b5", "digital"]).filter(id => state.on[id]);
+    if (!state.hold) frame++;
+    for (const canvas of screen.querySelectorAll("[data-graph]")) {
+      const c = canvas.getContext("2d"), w = canvas.width, h = canvas.height;
+      const waterfall = canvas.dataset.graph === "waterfall";
+      if (waterfall) c.drawImage(canvas, 0, 2);
+      else {
+        c.fillStyle = "#0a1119"; c.fillRect(0, 0, w, h);
+        c.strokeStyle = "#1c3441"; c.beginPath();
+        for (let x = 0; x < w; x += w / 8) { c.moveTo(x, 0); c.lineTo(x, h); }
+        for (let y = 0; y < h; y += h / 4) { c.moveTo(0, y); c.lineTo(w, y); }
+        c.stroke(); c.beginPath(); c.strokeStyle = "#66e1c8";
+      }
+      for (let x = 0; x < w; x++) {
+        let power = .13 + .034 * (Math.sin(x * 4.89 + frame * .62) + Math.cos(x * .37));
+        for (const id of signals) {
+          const center = frequencyX(examples[id].mhz || 2478, is24);
+          const spread = is24 || id === "digital" ? .052 : .023;
+          power += .61 * Math.exp(-((x / w - center) ** 2) / (spread ** 2));
+        }
+        if (waterfall) {
+          c.fillStyle = `hsl(${215 - 140 * Math.min(power, 1)}, 65%, ${18 + 49 * Math.min(power, 1)}%)`;
+          c.fillRect(x, 0, 1, 2);
+        } else c.lineTo(x, h - power * (h - 8));
+      }
+      if (!waterfall) c.stroke();
+      if (state.page === "scan" && !waterfall) {
+        c.fillStyle = "#ffcd85"; c.fillRect(frequencyX(state.tune.mhz, false) * (w - 1), 0, 1, h);
+      }
+    }
+    const image = screen.querySelector("[data-picture]:not([hidden])");
+    if (!image) return;
+    const c = image.getContext("2d"), w = image.width, h = image.height;
+    if (image.dataset.picture === "bench" && state.pattern !== 1) {
+      c.fillStyle = "#050505"; c.fillRect(0, 0, w, h);
+      if (state.pattern === 2) {
+        const ramp = c.createLinearGradient(0, 0, w, 0);
+        ramp.addColorStop(0, "#000"); ramp.addColorStop(1, "#eee");
+        c.fillStyle = ramp; c.fillRect(0, 0, w, h);
+      } else if (state.pattern === 3) {
+        c.fillStyle = "#ddd";
+        for (let x = 0; x < 8; x++) for (let y = x % 2; y < 6; y += 2) c.fillRect(x * w / 8, y * h / 6, w / 8, h / 6);
+      } else if (state.pattern === 4) {
+        c.fillStyle = "#ddd"; c.fillRect((frame * 6) % (w - 36), 0, 36, h);
+      }
+      return;
+    }
+    const shades = ["#ebebeb", "#c8c8c8", "#a7a7a7", "#838383", "#626262", "#414141", "#252525", "#131313"];
+    shades.forEach((shade, i) => { c.fillStyle = shade; c.fillRect(i * w / shades.length, 0, w / shades.length, h); });
+    if (image.dataset.picture === "analog") {
+      c.fillStyle = "#111d"; c.fillRect(w * .2, h * .39, w * .6, h * .23);
+      c.font = "bold 19px system-ui"; c.fillStyle = "#fff"; c.textAlign = "center";
+      c.fillText("FPV SCOUT · DEMO", w / 2, h * .54);
+    }
+  }
+  function updateScan(now) {
+    if (state.mode === "manual") return;
+    const before = state.status + state.tune.channel;
+    if (state.status === "Scanning" && now >= state.deadline) {
+      state.status = "Comparing";
+      state.deadline = now + 390;
+    } else if (state.status === "Comparing" && now >= state.deadline) {
+      const available = activeIds("analog").filter(id => id !== state.skip);
+      const best = available.sort((a, b) => examples[b].quality - examples[a].quality || examples[b].level - examples[a].level)[0];
+      if (best) tune(examples[best]);
+      else if (state.on.digital) tune({ channel: "R6", mhz: 5843 });
+      else startScan(state.skip);
+    } else if (state.status === "Scanning") {
+      const index = Math.floor((now - (state.deadline - 740)) * presets.length / 740);
+      state.tune = presets[Math.min(presets.length - 1, Math.max(0, index))];
+    } else if (state.lock) {
+      if (state.on[state.lock]) {
+        state.lostAt = 0;
+        if (state.status === "Sync lost") state.status = "Locked";
+        if (examples[state.lock].quality > 81) state.lowAt = 0;
+        else if (!state.lowAt) state.lowAt = now;
+        else if (settings.rescan && !state.recheckAt && now >= state.lastCheck && now - state.lowAt >= 600) {
+          state.status = "Rechecking";
+          state.recheckAt = now + 750;
+        }
+      } else {
+        if (!state.lostAt) state.lostAt = now;
+        state.status = "Sync lost";
+        if (settings.rescan && now - state.lostAt >= 5000) startScan();
+      }
+      if (state.recheckAt && now >= state.recheckAt && state.lock) {
+        const current = state.lock;
+        const alternative = activeIds("analog").find(id => id !== current && examples[id].quality >= examples[current].quality + 12);
+        if (alternative) tune(examples[alternative]);
+        else state.status = state.on[current] ? "Locked" : "Sync lost";
+        state.recheckAt = 0;
+        state.lastCheck = now + 10000;
+      }
+    } else if (state.status === "Digital signal" && !state.on.digital) startScan();
+    if (!state.lock) state.fullscreen = false;
+    if (before !== state.status + state.tune.channel) {
+      const badge = screen.querySelector(".badge");
+      const channel = screen.querySelector(".channel-readout");
+      if (state.status === "Scanning" && before.startsWith("Scanning") && badge && channel) channel.textContent = `${state.tune.channel} · ${state.tune.mhz} MHz`;
+      else render();
+    }
+  }
+  function saveLog() {
+    const csv = "signal,frequency_mhz,rssi,units,first_seen,last_seen,lost\r\n" + log.map(entry => {
+      const sample = examples[entry.id];
+      const iso = ms => ms ? new Date(ms).toISOString() : "";
+      return [sample.label, sample.mhz || "", sample.level, sample.unit, iso(entry.first), iso(entry.last), iso(entry.lost)].join(",");
+    }).join("\r\n") + "\r\n";
+    const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+    const link = document.createElement("a");
+    link.href = url; link.download = "FPV-Scout-Simulator-Log.csv"; link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+    state.notice = "CSV download requested";
+  }
+  function calibrateNext() {
+    const cal = state.calibration;
+    const active = activeIds(cal.kind);
+    state.notice = "";
+    if (cal.stage === "setup") {
+      if (cal.kind === "rid") cal.stage = "listening";
+      else if (active.length) state.notice = "Turn off the demo source, then try again.";
+      else cal.stage = "ready";
+    } else if (cal.stage === "ready" || cal.stage === "listening") {
+      if (active.length) Object.assign(cal, { stage: "review", result: active[0] });
+      else state.notice = "No matching demo source. Switch it on and retry.";
+    } else if (cal.stage === "review") {
+      references[cal.kind] = cal.result;
+      cal.stage = "saved";
+      persist();
+    } else Object.assign(cal, { stage: "setup", result: null });
+  }
+  screen.addEventListener("click", event => {
+    const action = event.target.closest("button[data-action]")?.dataset.action;
+    if (!action) return;
+    if (action.startsWith("open-")) {
+      state.calibration = null;
+      open(action.slice(5));
+      return;
+    }
+    if (action.startsWith("view-")) {
+      const kind = action.slice(5);
+      open(kind === "analog" || kind === "digital" ? "scan" : kind, kind);
+      return;
+    }
+    switch (action) {
+      case "back":
+        if (state.editor) state.editor = "";
+        else if (state.logItem) state.logItem = null;
+        else if (state.page === "calibration" && state.calibration) state.calibration = null;
+        else { open(state.page === "calibration" ? "settings" : "menu"); return; }
+        state.notice = "";
+        break;
+      case "fullscreen": state.fullscreen = !state.fullscreen; break;
+      case "mode":
+        if (state.mode === "auto") { state.mode = "manual"; tune(state.tune); }
+        else startScan();
+        break;
+      case "rescan": startScan(); break;
+      case "continue": startScan(state.lock); break;
+      case "switch-graph": state.waterfall = !state.waterfall; break;
+      case "edit-channel": state.editor = "preset"; break;
+      case "switch-editor": state.editor = state.editor === "preset" ? "frequency" : "preset"; break;
+      case "auto-rescan": settings.rescan = !settings.rescan; persist(); break;
+      case "orientation": settings.orientation = settings.orientation === "Portrait" ? "Landscape" : "Portrait"; persist(); break;
+      case "wallpaper": settings.wallpaper = { Main: "All", All: "Off", Off: "Main" }[settings.wallpaper]; persist(); break;
+      case "startup": {
+        const pages = Object.keys(startPages);
+        settings.startup = pages[(pages.indexOf(settings.startup) + 1) % pages.length];
+        persist();
+        break;
+      }
+      case "test-led": state.ledUntil = performance.now() + 3000; state.notice = "LED test running"; break;
+      case "hold":
+        state.hold = !state.hold;
+        event.target.closest("button").textContent = state.hold ? "Resume" : "Hold";
+        return;
+      case "spectrum-band": state.graph24 = !state.graph24; break;
+      case "pattern": state.pattern = (state.pattern + 1) % patterns.length; break;
+      case "format": state.format = state.format === "NTSC" ? "PAL" : "NTSC"; break;
+      case "save-log": saveLog(); break;
+      case "clear-log":
+        if (window.confirm("Clear the simulated signal log?")) { log.length = 0; persist(); state.notice = ""; }
+        break;
+      case "cal-next": calibrateNext(); break;
+      default:
+        if (action.startsWith("log-")) state.logItem = action.slice(4);
+        if (action.startsWith("cal-")) state.calibration = { kind: action.slice(4), stage: "setup", result: null };
+    }
+    render();
+  });
+  screen.addEventListener("submit", event => {
+    if (event.target.id !== "tune") return;
+    event.preventDefault();
+    if (!event.target.reportValidity()) return;
+    tune(state.editor === "preset" ? presets.find(p => p.channel === $("preset").value) : { channel: "Custom", mhz: $("frequency").valueAsNumber });
+    state.editor = "";
+    render();
+  });
+  $("sources").innerHTML = Object.entries(examples).map(([id, sample]) => `<div class="source">
+    <label><input type="checkbox" data-signal="${id}" ${state.on[id] ? "checked" : ""}>
+    <strong>${id === "b5" ? "Second analog source" : sample.label}</strong></label><small>${caption(id)}</small>
+    ${id === "r4" ? '<label class="quality">R4 quality <output id="quality-value">96%</output><input id="quality" type="range" min="35" max="99" value="96"></label>' : ""}</div>`).join("");
+  $("sources").addEventListener("change", event => {
+    const id = event.target.dataset.signal;
+    if (!id) return;
+    state.on[id] = event.target.checked;
+    const entry = log.find(item => item.id === id);
+    if (!state.on[id] && entry) { entry.lost = Date.now(); persist(); }
+    if (state.page === "scan" && !state.editor) {
+      if (state.mode === "manual") tune(state.tune);
+      else if (state.status === "Digital signal" && examples[id].kind === "analog" && state.on[id]) startScan();
+      else updateScan(performance.now());
+    }
+    render();
+  });
+  $("quality").addEventListener("input", event => {
+    examples.r4.quality = event.target.valueAsNumber;
+    $("quality-value").textContent = examples.r4.quality + "%";
+    if (state.lock === "r4") render();
+  });
+  $("restart").addEventListener("click", () => open(settings.startup));
+  let scanCycle = performance.now();
+  const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)");
+  setInterval(() => {
+    const now = performance.now();
+    if (state.page === "scan" && !state.editor) updateScan(now);
+    if (now - scanCycle >= 1250) {
+      scanCycle = now;
+      const kind = state.page === "menu" ? phases[state.phase] : state.page;
+      const id = activeIds(kind)[0];
+      if (id) observe(id);
+      if (state.page === "scan" && state.lock && state.on[state.lock]) observe(state.lock);
+      if (state.page === "scan" && state.status === "Digital signal" && state.on.digital) observe("digital");
+      if (state.page === "menu") {
+        state.phase = (state.phase + 1) % phases.length;
+        $("menu-phase").textContent = `Checking ${tools[phases[state.phase]].toLowerCase()}…`;
+        for (const result of screen.querySelectorAll("[data-result]")) {
+          const detected = state.seen[result.dataset.result];
+          result.textContent = detected && state.on[detected] ? caption(detected) : "Listening…";
+        }
+      }
+    }
+    if (!state.hold) paint();
+    const led = $("led");
+    led.dataset.on = now < state.ledUntil ? reducedMotion.matches || Math.floor(now / 300) % 2 === 0
+      : Boolean(state.page === "scan" && state.lock && state.on[state.lock]);
+    if (state.notice === "LED test running" && now >= state.ledUntil) { state.notice = "LED test complete"; render(); }
+  }, 125);
+  open(settings.startup);
+</script>
+</body>
+</html>
