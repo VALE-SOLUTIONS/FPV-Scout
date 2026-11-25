@@ -36,6 +36,7 @@ Standalone receive-only **FPV link scanning** on the RockBase NM-CYD-C5, with se
 
 ## Use and build
 
+- [FPV Scout Wiki](https://github.com/VALE-SOLUTIONS/FPV-Scout/wiki)
 - [Offline flasher build source and instructions](tools/offline-flasher)
 - [Installation, recovery, calibration and controls](docs/scanner.md)
 - [Validation and remaining hardware checks](docs/validation.md)
