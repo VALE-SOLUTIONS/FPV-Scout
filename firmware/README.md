@@ -1,6 +1,6 @@
 # Firmware images
 
-The standard release is **FPV Scout 1.17.0**, built for the RockBase NM-CYD-C5
+The standard release is **FPV Scout 1.19.0**, built for the RockBase NM-CYD-C5
 with ESP32-C5, 16 MB flash and 8 MB PSRAM. The
 [latest offline installer](https://github.com/VALE-SOLUTIONS/FPV-Scout/releases/latest/download/FPV-Scout-Offline-Flasher.html)
 bundles all three images.

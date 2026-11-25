@@ -14,23 +14,22 @@
 #define SCOUT_BUTTON_H 32
 #define SCOUT_ARROW_W(landscape) ((landscape) ? 32 : 24)
 #define SCOUT_RESCAN_Y 44
-#define SCOUT_SETTING_H 36
-#define SCOUT_ORIENTATION_Y 86
-#define SCOUT_WALLPAPER_Y 150
+#define SCOUT_SETTING_H 32
+#define SCOUT_ORIENTATION_Y 82
+#define SCOUT_SIGNAL_CAL_Y 118
+#define SCOUT_WALLPAPER_Y 154
 #define SCOUT_CALIBRATE_Y 190
 #define SCOUT_TEST_LED_PORTRAIT_Y 232
-#define SCOUT_MENU_CARD_H (landscape ? 25 : 34)
-#define SCOUT_MENU_ROW(i) ((landscape ? 47 : 65) + (i) * (landscape ? 29 : 39))
-#define SCOUT_MENU_SCAN_Y SCOUT_MENU_ROW(0)
-#define SCOUT_MENU_CONTROL_Y SCOUT_MENU_ROW(1)
-#define SCOUT_MENU_SPECTRUM_Y SCOUT_MENU_ROW(2)
-#define SCOUT_MENU_SETTINGS_Y SCOUT_MENU_ROW(3)
-#define SCOUT_MENU_REMOTE_ID_Y SCOUT_MENU_ROW(4)
-#define SCOUT_MENU_BENCH_Y SCOUT_MENU_ROW(5)
-#define SCOUT_LOG_BUTTON_X(width) ((width) - 112)
-#define SCOUT_LOG_BUTTON_Y 8
-#define SCOUT_LOG_BUTTON_W 100
-#define SCOUT_LOG_BUTTON_H 28
+#define SCOUT_ALL_ROW_Y 55
+#define SCOUT_ALL_ROW_H(landscape) ((landscape) ? 30 : 46)
+#define SCOUT_ALL_ROW_PITCH(landscape) (SCOUT_ALL_ROW_H(landscape) + ((landscape) ? 4 : 6))
+#define SCOUT_MENU_TOOL_Y(landscape) ((landscape) ? 192 : 264)
+#define SCOUT_MENU_TOOL_H(landscape) ((landscape) ? 20 : 24)
+#define SCOUT_MENU_TOOL_PITCH(landscape) (SCOUT_MENU_TOOL_H(landscape) + 4)
+#define SCOUT_START_PAGE_Y(landscape) ((landscape) ? SCOUT_RESCAN_Y : 270)
+#define SCOUT_CAL_ROW_Y 48
+#define SCOUT_CAL_ROW_H 32
+#define SCOUT_CAL_ROW_PITCH 37
 #define SCOUT_LOG_ROW_Y 66
 #define SCOUT_LOG_ROW_H 36
 #define SCOUT_LOG_ROWS(height) (((height) - SCOUT_LOG_ROW_Y - 52) / SCOUT_LOG_ROW_H)

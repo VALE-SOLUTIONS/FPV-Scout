@@ -21,14 +21,16 @@ code='''#include <assert.h>
 #include "scout_spectrum.h"
 #include "scout_digital.h"
 #include "scout_signal_log.h"
+#include "scout_signal_cal.h"
 #include "scout_indicator.h"
 #include "scout_version.h"
 #include "composite/bench.h"
 static int64_t clock_us=1000000;
 static int64_t esp_timer_get_time(void){return clock_us;}
-static unsigned captures,spectrum_calls,calibrations,orientation_loads,menu_draws,settings_draws,led_tests,led_hz;
+static unsigned captures,spectrum_calls,calibrations,orientation_loads,settings_draws,led_tests,led_hz;
 static unsigned opens,closes,bench_draws,bench_steps;
-static unsigned rid_starts,rid_stops,rid_steps;
+static unsigned rid_starts,rid_stops,rid_steps,all_draws;
+static bool rid_listening;
 static unsigned rid_test_wifi,rid_test_ble;
 static struct {unsigned channel,matches,ble_matches,latest_wifi_channel;int latest_wifi_rssi,latest_ble_rssi;bool ble_enabled,ble_window;} rid_state,*scout_rid;
 #define SCOUT_RID_EXPIRY_US 30000000LL
@@ -41,10 +43,12 @@ static void scout_log_save_to_sd(char *status,size_t size){
     if(log_sd_ok)scout_log_clear();
     snprintf(status,size,"%s",log_sd_ok?"Saved SC000001.CSV":"Save failed. Log kept.");
 }
-static void scout_rid_start(void){scout_rid=&rid_state;rid_starts++;}
-static void scout_rid_stop(void){scout_rid=NULL;rid_stops++;}
+static void scout_rid_start(void){scout_rid=&rid_state;if(!rid_listening)rid_starts++;rid_listening=true;}
+static void scout_rid_suspend(void){rid_listening=false;}
+static void scout_rid_stop(void){if(scout_rid)rid_stops++;scout_rid_suspend();scout_rid=NULL;}
+static unsigned scout_rid_recent(int64_t now){(void)now;return scout_rid?scout_rid->matches:0;}
 static void scout_rid_poll(int64_t now){
-    (void)now;rid_steps++;
+    (void)now;assert(rid_listening);rid_steps++;
     rid_state.matches+=rid_test_wifi+rid_test_ble;
     rid_state.ble_matches+=rid_test_ble;
     rid_test_wifi=rid_test_ble=0;
@@ -88,21 +92,47 @@ void cyd_touch_calibrate(bool force){if(force)calibrations++;else orientation_lo
 void cyd_reclaim_pins(void){}
 enum { ESP_OK=0, NVS_READONLY, NVS_READWRITE };
 typedef int nvs_handle_t;
-static int saved_rescan=-1;
+static int saved_rescan=-1,saved_start=-1;
+static scout_cal_reference_t stored_ref[5];
+static bool stored_ref_valid[5], fail_reference_write;
 static unsigned commits;
 static esp_err_t nvs_open(const char *name,int mode,nvs_handle_t *handle) {
     assert(strcmp(name,"cyd")==0);*handle=mode;return ESP_OK;
 }
 static esp_err_t nvs_get_u8(nvs_handle_t handle,const char *key,uint8_t *value) {
-    assert(handle==NVS_READONLY && strcmp(key,"auto_rescan")==0);
-    if(saved_rescan<0)return -1;
-    *value=(uint8_t)saved_rescan;return ESP_OK;
+    assert(handle==NVS_READONLY);
+    assert(!strcmp(key,"auto_rescan") || !strcmp(key,"start_page"));
+    const int saved=!strcmp(key,"start_page")?saved_start:saved_rescan;
+    if(saved<0)return -1;
+    *value=(uint8_t)saved;return ESP_OK;
 }
 static esp_err_t nvs_set_u8(nvs_handle_t handle,const char *key,uint8_t value) {
-    assert(handle==NVS_READWRITE && strcmp(key,"auto_rescan")==0);
-    saved_rescan=value;return ESP_OK;
+    assert(handle==NVS_READWRITE);
+    if(!strcmp(key,"start_page"))saved_start=value;
+    else{assert(!strcmp(key,"auto_rescan"));saved_rescan=value;}
+    return ESP_OK;
 }
 static esp_err_t nvs_commit(nvs_handle_t handle) {assert(handle==NVS_READWRITE);commits++;return ESP_OK;}
+static unsigned cal_slot(const char *key) {
+    const char *const keys[] = {"", "sigcal_ana_v1", "sigcal_dig_v1", "sigcal_ctl_v1", "sigcal_rid_v1"};
+    for (unsigned i=1;i<5;i++) if(!strcmp(key,keys[i])) return i;
+    assert(!"unknown calibration key");
+    return 0;
+}
+static esp_err_t nvs_get_blob(nvs_handle_t handle,const char *key,void *value,size_t *size) {
+    assert(handle==NVS_READONLY && *size==sizeof(scout_cal_reference_t));
+    unsigned slot=cal_slot(key);
+    if(!stored_ref_valid[slot]) return -1;
+    memcpy(value,&stored_ref[slot],*size);
+    return ESP_OK;
+}
+static esp_err_t nvs_set_blob(nvs_handle_t handle,const char *key,const void *value,size_t size) {
+    assert(handle==NVS_READWRITE && size==sizeof(scout_cal_reference_t));
+    if(fail_reference_write) return -1;
+    unsigned slot=cal_slot(key);
+    memcpy(&stored_ref[slot],value,size);stored_ref_valid[slot]=true;
+    return ESP_OK;
+}
 static void nvs_close(nvs_handle_t handle){(void)handle;}
 void cyd_wallpaper_init(void){}
 esp_err_t cyd_init_with_bus_hook(void (*setup)(void)){setup();return ESP_OK;}
@@ -134,7 +164,7 @@ static unsigned rx_bandwidth_phy_mode(unsigned width){return width;}
 static int rx_bandwidth_dcap(unsigned width){return (int)width;}
 static void prepare_rx(void){rx_ready=true;}
 '''+tune+'''
-static bool scripted;
+static bool scripted, unstable_hold;
 static unsigned samples_seen[SCOUT_COUNT];
 static int32_t strengths[SCOUT_COUNT];
 static int32_t scout_measure_signal(void){return strengths[scout.channel];}
@@ -143,8 +173,11 @@ static fpv_evidence_t scripted_detect(const uint32_t *w,int16_t *bins) {
     unsigned ch=scout.channel, sample=++samples_seen[ch];
     if (!strengths[ch]) return (fpv_evidence_t){0};
     if (!scout.comparing) return (fpv_evidence_t){7,0,1};
+    if (scout.rechecking) assert(frequency_mhz==scout_channels[ch].mhz);
     if (ch==22) return (fpv_evidence_t){10,0,1}; /* strong H only */
     if (sample%4==0) return (fpv_evidence_t){0,3,1};
+    if (scout.rechecking && unstable_hold && ch==scout.recheck_channel && sample%2==0)
+        return (fpv_evidence_t){0};
     return (fpv_evidence_t){ch==20?10:5,0,1};
 }
 #undef fpv_detect
@@ -164,6 +197,13 @@ static bool scout_video_capture(void){
 static bool scout_video_live(int64_t now){(void)now;return false;}
 static void scout_spectrum_step(int64_t now){
     scout.spectrum_tick=now;spectrum_calls++;
+    if(scout.page==SCOUT_MENU)scout.spectrum_step=(scout.spectrum_step+1)%SCOUT_SWEEP_STEPS;
+    if(scout.page==SCOUT_SIGNAL_CAL){
+        unsigned n=scout.cal.tool==SCOUT_CAL_CONTROL?3:SCOUT_SWEEP_STEPS;
+        scout.spectrum_step=(scout.spectrum_step+1)%n;
+        scout.spectrum_valid=true;
+        scout.floor_est=-3100;
+    }
     if(scout.page==SCOUT_SPECTRUM || scout.page==SCOUT_CONTROL){
         scout.spectrum_updated=now;scout.spectrum_valid=true;
         scout.spectrum_plot[0]=scout.floor_est+2500;
@@ -176,26 +216,245 @@ static void scout_draw_scan_channel(bool sweeping){
 }
 static void scout_draw_scan_plot(void){scout.scan_plot_dirty=false;}
 static void scout_draw(int64_t now){scout.dirty=false;scout.last_draw=now;scout_draw_scan_plot();}
-static void scout_draw_menu(void){scout.dirty=false;menu_draws++;}
 static void scout_draw_signal_log(int64_t now){scout.dirty=false;scout.last_draw=now;}
 static void scout_draw_remote_id(int64_t now){scout.dirty=false;scout.last_draw=now;}
+static void scout_draw_all(int64_t now){scout.dirty=false;scout.last_draw=now;all_draws++;}
+static void scout_draw_calibration(int64_t now){scout.dirty=false;scout.last_draw=now;}
 static void scout_draw_control(bool waterfall_changed){(void)waterfall_changed;scout.dirty=false;}
 static void scout_draw_tuner(void){scout.dirty=false;}
 static void scout_draw_settings(void){scout.dirty=false;settings_draws++;}
 static void scout_draw_bench(int64_t now){scout.dirty=false;scout.last_draw=now;bench_draws++;}
 '''+nav+init+command+spectrum_history+step+'''
 static void tap(int x,int y){pressed=false;scout_input();touch_x=x;touch_y=y;pressed=true;scout_input();pressed=false;scout_input();}
+static void menu_card(unsigned row){tap(cyd_width()/2,SCOUT_ALL_ROW_Y+(int)row*SCOUT_ALL_ROW_PITCH(cyd_landscape())+6);}
+static void menu_tool(unsigned tool){
+    tap((tool%2?3:1)*cyd_width()/4,SCOUT_MENU_TOOL_Y(cyd_landscape())+
+        (int)(tool/2)*SCOUT_MENU_TOOL_PITCH(cyd_landscape())+6);
+}
+static void test_recheck(void) {
+    scout.manual=false;
+    scout_open_page(SCOUT_SCAN_PAGE);
+    scout.auto_rescan=true;
+    scout.channel=3;
+    scout.scan=(fpv_scan_t){.mode=FPV_LOCK,.polarity=1,.last_sync=clock_us};
+    scout.lq_samples=16;
+    scout.lq_history=0xffff;
+    assert(!scout_recheck_due(clock_us));
+    scout.lq_history=0xdddd;
+    assert(!scout_recheck_due(clock_us)); /* A brief dip is insufficient. */
+    clock_us+=SCOUT_RECHECK_BAD_US;
+    scout.scan.last_sync=clock_us;
+    scout.manual=true;
+    assert(!scout_recheck_due(clock_us));
+    scout.manual=false;
+    scout.auto_rescan=false;
+    assert(!scout_recheck_due(clock_us));
+    scout.auto_rescan=true;
+    assert(!scout_recheck_due(clock_us));
+
+    clock_us+=SCOUT_RECHECK_BAD_US;
+    scout.scan.last_sync=clock_us;
+    scout.next_check=clock_us+100000;
+    cyd_ui_step();
+    assert(scout.rechecking && scout_current_channel().mhz==5769);
+    assert(cyd_ui_command("SCOUT?") && strstr(response,"mode=RECHECK freq=5769"));
+    scout.video_live=true;
+    scripted=unstable_hold=true;
+    capture_fail=false;
+    memset(samples_seen,0,sizeof(samples_seen));
+    memset(strengths,0,sizeof(strengths));
+    strengths[3]=200; strengths[18]=300; strengths[20]=400; strengths[22]=500;
+    for(unsigned i=0;scout.rechecking && i<300;i++){
+        assert(scout.video_live && scout_current_channel().mhz==5769);
+        clock_us+=3000;
+        cyd_ui_step();
+    }
+    assert(!scout.rechecking && scout.channel==20 && scout.last_compared==4);
+    assert(scout.scan.mode==FPV_LOCK && !scout.video_live); /* New feed needs fresh rows. */
+    scout.lq_samples=16;
+    scout.lq_history=0xdddd;
+    scout.recheck_bad_at=clock_us-SCOUT_RECHECK_BAD_US;
+    scout.scan.last_sync=clock_us;
+    assert(!scout_recheck_due(clock_us)); /* Post-check cooldown. */
+
+    unstable_hold=false;
+    scout.video_live=true;
+    scout_start_recheck(clock_us);
+    for(unsigned i=0;scout.rechecking && i<300;i++){clock_us+=3000;cyd_ui_step();}
+    assert(!scout.rechecking && scout.channel==20 && scout.video_live && scout.scan.mode==FPV_LOCK);
+
+    scout_start_recheck(clock_us);
+    clock_us+=SCOUT_RECHECK_MAX_US;
+    cyd_ui_step();
+    assert(!scout.rechecking && scout.channel==20 && scout.video_live); /* Bounded RF pause. */
+
+    scout.candidate_count=2;
+    scout.candidates[0]=(scout_candidate_t){.sync={.mode=FPV_HIT},.observations=10,.valid_h=9,
+        .video_checks=5,.clean_lines=30};
+    scout.candidates[1]=(scout_candidate_t){.observations=10,.valid_h=9,.video_checks=5,.clean_lines=24};
+    assert(scout_recheck_winner()==0); /* Cleaner lines can win at similar sync coverage. */
+    scout.candidates[1].clean_lines=40;
+    assert(scout_recheck_winner()<0); /* A stronger challenger alone cannot displace the picture. */
+    scripted=false;
+}
+static void test_scan_all(void) {
+    landscape=false;
+    scout_open_page(SCOUT_MENU);
+    assert(scout.page==SCOUT_MENU && scout.all.phase==SCOUT_ALL_ANALOG);
+    scripted=true;memset(samples_seen,0,sizeof(samples_seen));memset(strengths,0,sizeof(strengths));
+    strengths[3]=500;
+    unsigned completed=scout.sweeps,before=spectrum_calls;
+    for(unsigned i=0;scout.all.phase==SCOUT_ALL_ANALOG && i<240;i++){clock_us+=3000;cyd_ui_step();}
+    assert(scout.all.phase==SCOUT_ALL_DIGITAL && scout.sweeps==completed+1);
+    assert(scout.all.analog_channel==3 && scout.all.analog_at && spectrum_calls==before);
+    for(unsigned i=0;i<SCOUT_SWEEP_STEPS;i++){clock_us+=3000;cyd_ui_step();}
+    assert(scout.all.phase==SCOUT_ALL_CONTROL && spectrum_calls==before+SCOUT_SWEEP_STEPS);
+    cyd_ui_step();
+    assert(scout.all.phase==SCOUT_ALL_RID && rid_listening);
+    rid_test_ble=1;cyd_ui_step();
+    clock_us=scout.all.rid_until;cyd_ui_step();
+    assert(scout.all.phase==SCOUT_ALL_ANALOG && !rid_listening && scout_rid);
+    assert(cyd_ui_command("SCOUT?") && strstr(response,"mode=ALL phase=ANALOG analog_mhz=5769"));
+    tap(120,SCOUT_ALL_ROW_Y+6);
+    assert(scout.page==SCOUT_SCAN_PAGE && !scout.manual && scout.channel==3 && scout.scan.mode==FPV_VERIFY && !scout_rid);
+    before=rid_starts;
+    cyd_ui_step();assert(rid_starts==before);
+    scout_open_page(SCOUT_MENU);
+    scout.all.digital.shown=(scout_rf_hit_t){5800,15000,2500,SCOUT_RF_O4};
+    tap(120,SCOUT_ALL_ROW_Y+SCOUT_ALL_ROW_PITCH(false)+6);
+    assert(scout.page==SCOUT_SCAN_PAGE && scout.manual_mhz==5800 && scout.digital.shown.kind==SCOUT_RF_O4);
+    landscape=true;
+    scout_open_page(SCOUT_MENU);
+    scout.control.elrs_hops=2;
+    tap(160,SCOUT_ALL_ROW_Y+2*SCOUT_ALL_ROW_PITCH(true)+6);
+    assert(scout.page==SCOUT_CONTROL && scout.control.elrs_hops==2);
+    scout_open_page(SCOUT_MENU);
+    scout_rid_start();
+    const unsigned starts=rid_starts;
+    tap(160,SCOUT_ALL_ROW_Y+3*SCOUT_ALL_ROW_PITCH(true)+6);
+    assert(scout.page==SCOUT_REMOTE_ID && rid_starts==starts);
+    tap(30,20);
+    assert(scout.page==SCOUT_MENU && !rid_listening && !scout_rid && all_draws>=5);
+    scripted=false;
+}
+static void test_start_page(void) {
+    landscape=false;
+    saved_start=-1;
+    memset(&scout,0,sizeof(scout));cyd_ui_init();
+    assert(scout.start_page==0 && scout.page==SCOUT_MENU);
+    menu_tool(1);
+    tap(138,288);
+    assert(scout.start_page==1 && saved_start==0 && scout.page==SCOUT_SETTINGS);
+    memset(&scout,0,sizeof(scout));cyd_ui_init();
+    assert(scout.start_page==1 && scout.page==SCOUT_SCAN_PAGE);
+    landscape=true;
+    scout_open_page(SCOUT_SETTINGS);
+    tap(240,60);
+    assert(scout.start_page==2 && saved_start==3);
+    memset(&scout,0,sizeof(scout));cyd_ui_init();
+    assert(scout.page==SCOUT_CONTROL);
+    saved_start=2;
+    memset(&scout,0,sizeof(scout));cyd_ui_init();
+    assert(scout.page==SCOUT_MENU && scout.start_page==0);
+    saved_start=255;
+    memset(&scout,0,sizeof(scout));cyd_ui_init();
+    assert(scout.page==SCOUT_MENU && scout.start_page==0);
+}
+static void choose_calibration(unsigned tool) {
+    assert(scout.page==SCOUT_SIGNAL_CAL && scout.cal.tool==SCOUT_CAL_MENU);
+    tap(100,SCOUT_CAL_ROW_Y+(int)(tool-SCOUT_CAL_ANALOG)*SCOUT_CAL_ROW_PITCH+8);
+    assert(scout.cal.tool==tool && scout.cal.stage==SCOUT_CAL_SETUP);
+}
+static void calibration_action(void) { tap(100,SCOUT_BUTTON_Y+8); }
+static void calibration_baseline(unsigned tool) {
+    choose_calibration(tool);
+    calibration_action();
+    assert(scout.cal.stage==SCOUT_CAL_BASELINE && !scout.cal.baseline_ready);
+    for (unsigned i=0;scout.cal.stage==SCOUT_CAL_BASELINE && i<70;i++) {
+        clock_us+=3000;
+        cyd_ui_step();
+    }
+    assert(scout.cal.stage==SCOUT_CAL_READY && scout.cal.baseline_ready);
+    assert(scout.cal.baseline_passes==3 && scout.cal.result.floor==-3100);
+    calibration_action();
+    assert(scout.cal.stage==SCOUT_CAL_CHECK);
+}
+static void test_signal_calibration(void) {
+    landscape=true;
+    scout_open_page(SCOUT_SETTINGS);
+    tap(155,SCOUT_SIGNAL_CAL_Y+8);
+    assert(scout.page==SCOUT_SIGNAL_CAL && scout.cal.tool==SCOUT_CAL_MENU);
+    const unsigned log_count=scout_log.count;
+
+    calibration_baseline(SCOUT_CAL_ANALOG);
+    scout.channel=3;
+    scout.scan=(fpv_scan_t){.mode=FPV_LOCK,.polarity=1,.last_sync=clock_us};
+    scout.lq_history=0xffff;scout.lq_samples=16;
+    scout.cal.next_sample=clock_us+100000;
+    sv_v.rows=SCOUT_VIDEO_H;sv_v.tv_ok=true;sv_v.pal=true;
+    cyd_ui_step();
+    assert(scout.cal.stage==SCOUT_CAL_REVIEW && scout.cal.result.signal==1);
+    assert(scout.cal.result.mhz==5769 && scout.cal.result.quality==100 && scout.cal.result.level==100);
+    fail_reference_write=true;calibration_action();
+    assert(scout.cal.stage==SCOUT_CAL_REVIEW && scout.cal.save_failed && !stored_ref_valid[SCOUT_CAL_ANALOG]);
+    fail_reference_write=false;calibration_action();
+    assert(scout.cal.stage==SCOUT_CAL_SAVED && stored_ref_valid[SCOUT_CAL_ANALOG]);
+    tap(30,20);choose_calibration(SCOUT_CAL_ANALOG);
+    assert(scout.cal.saved_valid && scout.cal.saved.mhz==5769 && scout.cal.saved.floor==-3100);
+    tap(30,20);
+
+    calibration_baseline(SCOUT_CAL_DIGITAL);
+    assert(scout.cal.quiet_plot && !scout_cal_peak_rise(scout.cal.quiet_plot,scout.spectrum_plot,0,2));
+    const int16_t quiet[]={-3200,-3000,-3100}, active[]={-3200,-2400,-3100};
+    assert(!scout_cal_peak_rise(quiet,quiet,0,2) && scout_cal_peak_rise(quiet,active,0,2));
+    scout.digital.shown=(scout_rf_hit_t){5820,16000,2300,SCOUT_RF_UNKNOWN};
+    cyd_ui_step();
+    assert(scout.cal.stage==SCOUT_CAL_REVIEW && scout.cal.result.mhz==5820 && scout.cal.result.level==2300);
+    tap(30,20);
+    assert(!scout.cal.quiet_plot);
+
+    calibration_baseline(SCOUT_CAL_CONTROL);
+    scout.control.elrs_hops=1;
+    cyd_ui_step();
+    assert(scout.cal.stage==SCOUT_CAL_CHECK);
+    clock_us=scout.cal.deadline;cyd_ui_step();
+    assert(scout.cal.stage==SCOUT_CAL_FAILED && scout.cal.baseline_ready);
+    calibration_action();
+    assert(scout.cal.stage==SCOUT_CAL_CHECK);
+    scout.control.elrs_hops=2;
+    scout.control.elrs=(scout_control_reading_t){.dbfs=-38,.quality=84};
+    cyd_ui_step();
+    assert(scout.cal.stage==SCOUT_CAL_REVIEW && scout.cal.result.level==-38 && scout.cal.result.quality==84);
+    tap(30,20);
+
+    choose_calibration(SCOUT_CAL_RID);
+    rid_state.matches=rid_state.ble_matches=0;
+    rid_state.latest_ble_rssi=-62;
+    calibration_action();
+    assert(scout.cal.stage==SCOUT_CAL_CHECK && rid_listening);
+    rid_test_ble=1;cyd_ui_step();
+    assert(scout.cal.result.signal==2 && scout.cal.result.other_level==-62);
+    calibration_action();
+    assert(scout.cal.stage==SCOUT_CAL_REVIEW && !rid_listening);
+    tap(30,20);choose_calibration(SCOUT_CAL_RID);
+    calibration_action();
+    assert(rid_listening);
+    tap(30,20);
+    assert(!rid_listening && !scout_rid && scout.cal.tool==SCOUT_CAL_MENU);
+    tap(30,20);
+    assert(scout.page==SCOUT_SETTINGS && scout_log.count==log_count);
+}
 static void test_signal_log(void) {
     memset(&scout_log,0,sizeof(scout_log));
     scout_log.run=1;
     landscape=false;
     scout_open_page(SCOUT_MENU);
-    tap(180,20);
+    menu_tool(2);
     assert(scout.page==SCOUT_SIGNAL_LOG && scout.log_page==0);
     unsigned before=captures;
     cyd_ui_step();
     assert(captures==before && cyd_ui_command("SCOUT?") && strstr(response,"mode=LOG entries=0"));
-    tap(30,20);tap(120,92);
+    tap(30,20);menu_card(SCOUT_ALL_ANALOG);
     scout.manual_mhz=5769;
     scout_confirmed();
     assert(scout_log.count==1 && scout_log.entries[0].mhz==5769 && scout_log.entries[0].kind==SCOUT_LOG_ANALOG);
@@ -224,7 +483,7 @@ static void test_signal_log(void) {
     for(unsigned i=0;i<35;i++) scout_log_record(SCOUT_LOG_ANALOG,5600+i,0,clock_us);
     assert(scout_log.count==SCOUT_LOG_CAPACITY && scout_log.entries[0].mhz==5631);
     assert(scout_log.entries[SCOUT_LOG_CAPACITY-1].mhz==5600);
-    tap(30,20);tap(180,20);
+    tap(30,20);menu_tool(2);
     assert(scout.page==SCOUT_SIGNAL_LOG && scout.log_page==0);
     for(unsigned i=0;i<12;i++) tap(180,48);
     assert(scout.log_page==(SCOUT_LOG_CAPACITY-1)/SCOUT_LOG_ROWS(320));
@@ -234,7 +493,7 @@ static void test_signal_log(void) {
     tap(60,300);assert(strstr(scout.log_status,"Save failed") && scout_log.count==SCOUT_LOG_CAPACITY);
     tap(30,20);assert(scout.page==SCOUT_MENU && scout_log.count==SCOUT_LOG_CAPACITY);
     landscape=true;
-    tap(254,20);assert(scout.page==SCOUT_SIGNAL_LOG && scout.log_page==0);
+    menu_tool(2);assert(scout.page==SCOUT_SIGNAL_LOG && scout.log_page==0);
     tap(250,48);assert(scout.log_page==1);
     tap(70,48);assert(scout.log_page==0);
     log_sd_ok=true;
@@ -323,6 +582,7 @@ static void test_tuner(bool rotated) {
     tap(w/4,apply);assert(!scout.manual && !scout.manual_mhz && scout.channel==0);
 }
 int main(void){
+    saved_start=0;
     cyd_ui_init();
     assert(scout.up && scout.page==SCOUT_SCAN_PAGE && !scout.manual);
     assert(orientation_loads==1 && !scout.sweep_start && scout.auto_rescan);
@@ -332,16 +592,17 @@ int main(void){
     captures=0;spectrum_calls=0;orientation_loads=0;
     scout.scan.mode=FPV_LOCK;scout.video_live=true;
     cyd_ui_step();cyd_ui_step();
-    assert(menu_draws==1 && captures==0 && spectrum_calls==0 && wallpaper_ticks==2);
-    tap(120,210);assert(scout.page==SCOUT_SETTINGS);
+    assert(all_draws==1 && captures==2 && spectrum_calls==0 && wallpaper_ticks==2);
+    captures=0;
+    menu_tool(1);assert(scout.page==SCOUT_SETTINGS);
     cyd_ui_step();assert(settings_draws==1 && captures==0 && spectrum_calls==0 && wallpaper_ticks==2);
     tap(120,96);assert(landscape && orientation_loads==1 && scout.page==SCOUT_SETTINGS);
     tap(280,164);assert(wallpaper_choices==1 && wallpaper_reloads==0);
     tap(280,212);assert(led_tests==1);
     tap(100,212);assert(calibrations==1);
     tap(30,20);assert(scout.page==SCOUT_MENU);
-    tap(280,65);assert(scout.page==SCOUT_SCAN_PAGE);
-    tap(30,20);tap(280,145);assert(scout.page==SCOUT_SETTINGS);
+    menu_card(SCOUT_ALL_ANALOG);assert(scout.page==SCOUT_SCAN_PAGE);
+    tap(30,20);menu_tool(1);assert(scout.page==SCOUT_SETTINGS);
     tap(280,96);assert(!landscape && orientation_loads==2 && scout.page==SCOUT_SETTINGS);
     assert(captures==0 && spectrum_calls==0);
     tap(90,184);assert(wallpaper_mode==CYD_WALLPAPER_ALL && scout.dirty);
@@ -357,14 +618,14 @@ int main(void){
     pressed=false;scout_input();
     tap(30,20);assert(scout.page==SCOUT_MENU);
     scout.scan=(fpv_scan_t){.mode=FPV_VERIFY,.h_bursts=3,.v_bursts=1,.last_sync=100};
-    tap(120,133);assert(scout.page==SCOUT_CONTROL && scout.waterfall);
+    menu_card(SCOUT_ALL_CONTROL);assert(scout.page==SCOUT_CONTROL && scout.waterfall);
     cyd_ui_step();assert(scout.page==SCOUT_CONTROL && scout.waterfall_count==1);
     assert(cyd_ui_command("SCOUT?") && strstr(response,"mode=CONTROL") && strstr(response,"waterfall_rows=1"));
     assert(scout_control_probability(&(scout_control_reading_t){.seen=true},0)==67);
     assert(scout_control_probability(&(scout_control_reading_t){.history=0xFF,.seen=true},9)==90);
     assert(scout_control_probability(&(scout_control_reading_t){.history=0x07},8)==40);
     tap(30,20);assert(!scout.waterfall);
-    tap(120,92);assert(scout.page==SCOUT_SCAN_PAGE);
+    menu_card(SCOUT_ALL_ANALOG);assert(scout.page==SCOUT_SCAN_PAGE);
     assert(cyd_ui_command("WALLPAPER RELOAD") && strstr(response,"open_menu_or_settings") && wallpaper_reloads==1);
     assert(scout.scan.mode==FPV_SCAN && !scout.scan.h_bursts && !scout.scan.v_bursts && !scout.scan.last_sync && !scout.video_live && !scout.tuned);
     assert(scout.waterfall && !scout.scan_waterfall);
@@ -374,8 +635,8 @@ int main(void){
     cyd_ui_step();assert(captures==1 && wallpaper_ticks==2);
     tap(30,20);assert(scout.page==SCOUT_MENU);
     unsigned before=captures;clock_us+=10000000;
-    cyd_ui_step();assert(captures==before);
-    tap(120,92);capture_fail=false;scout.errors=0;
+    cyd_ui_step();assert(captures==before+1);
+    menu_card(SCOUT_ALL_ANALOG);capture_fail=false;scout.errors=0;
     static int16_t bins[FPV_BINS];scout.bins=bins;
     scout.scan.mode=FPV_LOCK;scout.scan.last_sync=clock_us;
     scout.spectrum_valid=true;scout.spectrum_updated=clock_us;scout.spectrum_tick=clock_us;
@@ -393,7 +654,7 @@ int main(void){
     assert(cyd_ui_command("BENCH black") && strstr(response,"open_composite_bench"));
     assert(!opens && !scout_bench.running);
     before=captures;unsigned prev_sweep=spectrum_calls;
-    tap(120,273);
+    menu_tool(3);
     assert(scout.page==SCOUT_BENCH && opens==1 && scout_bench.running && scout_bench.pattern==PAT_BLACK);
     cyd_ui_step();assert(bench_draws==1 && bench_steps==1 && captures==before && spectrum_calls==prev_sweep);
     tap(170,300);assert(scout_bench.pattern==PAT_BARS);
@@ -402,7 +663,7 @@ int main(void){
     assert(cyd_ui_command("BENCH ramp") && scout_bench.pattern==PAT_RAMP);
     stop_allowed=false;tap(30,20);assert(scout.page==SCOUT_BENCH && scout_bench.running);
     stop_allowed=true;tap(30,20);assert(scout.page==SCOUT_MENU && closes==2 && !scout_bench.running);
-    tap(120,92);cyd_ui_step();assert(captures==before+1);
+    menu_card(SCOUT_ALL_ANALOG);cyd_ui_step();assert(captures==before+1);
     unsigned channel=scout.channel;
     tap(50,300);assert(scout.manual && !scout.next_check);
     before=captures;
@@ -477,7 +738,7 @@ int main(void){
     clock_us++;
     cyd_ui_step();assert(scout.scan.mode==FPV_SCAN && scout.channel==0 && !scout.skipped_mhz);
     video_rf=video_rows=false;
-    tap(30,20);tap(120,210);
+    tap(30,20);menu_tool(1);
     tap(120,57);assert(scout.page==SCOUT_SETTINGS && !scout.auto_rescan && saved_rescan==0 && commits==1);
     memset(&scout,0,sizeof(scout));
     cyd_ui_init();assert(!scout.auto_rescan && scout.page==SCOUT_SCAN_PAGE);
@@ -486,16 +747,17 @@ int main(void){
     scout.scan=(fpv_scan_t){.mode=FPV_LOCK,.last_sync=clock_us};
     clock_us+=2*SCOUT_SYNC_TIMEOUT_US;
     cyd_ui_step();assert(scout.scan.mode==FPV_LOCK && scout.channel==20 && scout.manual);
-    tap(30,20);tap(120,210);
+    tap(30,20);menu_tool(1);
     tap(120,57);assert(scout.auto_rescan && saved_rescan==1 && commits==2);
-    tap(30,20);tap(120,92);
+    tap(30,20);menu_card(SCOUT_ALL_ANALOG);
+    scout.manual=true;scout.channel=20;
     scout.scan=(fpv_scan_t){.mode=FPV_SCAN};
     clock_us+=2*SCOUT_SYNC_TIMEOUT_US;
     cyd_ui_step();assert(scout.manual && scout.channel==20 && scout.scan.mode==FPV_SCAN);
     scout.scan=(fpv_scan_t){.mode=FPV_LOCK,.last_sync=clock_us};
     clock_us+=SCOUT_SYNC_TIMEOUT_US;
     cyd_ui_step();assert(!scout.manual && scout.scan.mode==FPV_SCAN && scout.channel==0);
-    tap(30,20);tap(120,171);
+    tap(30,20);menu_tool(0);
     assert(scout.page==SCOUT_SPECTRUM && scout.waterfall && !scout.spectrum_held);
     before=captures;prev_sweep=spectrum_calls;
     cyd_ui_step();
@@ -508,7 +770,7 @@ int main(void){
     clock_us+=1000;cyd_ui_step();
     assert(scout.waterfall_count==1 && captures==before);
     tap(30,20);
-    tap(120,236);assert(scout.page==SCOUT_REMOTE_ID && rid_starts==1 && !scout.waterfall);
+    menu_card(SCOUT_ALL_RID);assert(scout.page==SCOUT_REMOTE_ID && rid_starts==1 && !scout.waterfall);
     cyd_ui_step();assert(rid_steps==1);
     assert(cyd_ui_command("SCOUT?") && strstr(response,"mode=REMOTEID active=1"));
     tap(30,20);assert(scout.page==SCOUT_MENU && rid_stops==1 && !scout_rid);
@@ -518,7 +780,11 @@ int main(void){
     test_overlapping_channels();
     test_signal_log();
     test_fullscreen_video();
-    puts("PASS: navigation and signal history in both orientations, manual tuning, live scan, top-three comparison, spectrum controls, and saved sync-loss rescan");
+    test_scan_all();
+    test_recheck();
+    test_start_page();
+    test_signal_calibration();
+    puts("PASS: calibration workflows and persistence, menu RF handoff, startup selection, fullscreen and unstable-LQ rechecks");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='scout-navigation-') as d:

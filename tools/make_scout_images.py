@@ -37,6 +37,7 @@ def render():
 #include "scout_digital.h"
 #include "scout_navigation.h"
 #include "scout_signal_log.h"
+#include "scout_signal_cal.h"
 #include "scout_remote_id.h"
 #include "composite/bench.h"
 #define sv_FRAME_HOLD_US 3000000
@@ -105,29 +106,41 @@ int main(int argc,char **argv) {
     assert(cyd_label_width("~5805 MHz  /  Medium confidence",CYD_FONT_SMALL)<=CYD_W);
     assert(cyd_label_width("Control Link Scanner",CYD_FONT_UI)<=CYD_W-80);
     assert(cyd_label_width("Control Links",CYD_FONT_TITLE)<=CYD_W-86);
-    assert(16+cyd_label_width("FPV Scout",CYD_FONT_TITLE)<=SCOUT_LOG_BUTTON_X(CYD_W));
-    assert(cyd_label_width("Signal Log",CYD_FONT_UI)<=SCOUT_LOG_BUTTON_W-18);
+    assert(cyd_label_width("Signal Calibration",CYD_FONT_TITLE)<=CYD_W-77);
+    assert(cyd_label_width("Switch off your video transmitter.",CYD_FONT_SMALL)<=CYD_W-32);
+    assert(cyd_label_width("Listening for the reference signal.",CYD_FONT_SMALL)<=CYD_W-32);
+    assert(32+cyd_label_width("FPV Scout",CYD_FONT_TITLE)+cyd_label_width(SCOUT_VERSION_LABEL,CYD_FONT_SMALL)<=CYD_W);
+    assert(cyd_label_width("Composite",CYD_FONT_SMALL)<=CYD_W/2-26);
     assert(78+cyd_label_width("Signal Details",CYD_FONT_TITLE)<=CYD_W);
     assert(cyd_label_width("DJI OcuSync",CYD_FONT_UI)+
            cyd_label_width("Likely 2484 MHz",CYD_FONT_SMALL)+48<=CYD_W);
     cyd_label(-4,-4,"Clipped",CYD_WHITE,CYD_BLACK,CYD_FONT_NUMBER);
     cyd_label(CYD_W-4,CYD_H-3,"Clipped",CYD_WHITE,CYD_BLACK,CYD_FONT_UI);
     cyd_label(400,400,"Offscreen",CYD_WHITE,CYD_BLACK,CYD_FONT_UI);
-    const char *names[]={"scout-scanning","scout-checking","scout-video-found","scout-locked","scout-sync-lost","scout-error","scout-menu","scout-settings","scout-composite-bench","scout-spectrum","scout-waterfall","scout-tune-channel","scout-tune-frequency","scout-digital","scout-control","scout-signal-log","scout-signal-details"};
+    const char *names[]={"scout-scanning","scout-checking","scout-video-found","scout-locked","scout-sync-lost","scout-error","scout-menu","scout-settings","scout-composite-bench","scout-spectrum","scout-waterfall","scout-tune-channel","scout-tune-frequency","scout-digital","scout-control","scout-signal-log","scout-signal-details",
+                         "scout-all-results","scout-all-start","scout-start-page","scout-all-analog-result","scout-all-remote-result","scout-rechecking",
+                         "scout-calibration","scout-analog-calibration","scout-rid-calibration"};
+    enum { SCREENS = sizeof(names) / sizeof(names[0]) };
     static uint8_t composite[49920];
     static uint8_t history[SCOUT_SPEC_W*SCOUT_WATERFALL_ROWS];
-    for(int i=0;i<34;i++) {
-        int k=i%17;
-        landscape=i>=17;
+    static scout_rid_state_t sample_rid;
+    for(int i=0;i<2*SCREENS;i++) {
+        int k=i%SCREENS;
+        landscape=i>=SCREENS;
         memset(&scout,0,sizeof(scout));
+        scout_rid=NULL;
         scout.auto_rescan=true;
-        scout.page=k==6?SCOUT_MENU:k==7?SCOUT_SETTINGS:k==8?SCOUT_BENCH:k==9?SCOUT_SPECTRUM:k==14?SCOUT_CONTROL:SCOUT_SCAN_PAGE;
+        scout.page=k==6||k==17||k==18?SCOUT_MENU:k==7||k==19?SCOUT_SETTINGS:k==8?SCOUT_BENCH:
+                   k==9?SCOUT_SPECTRUM:k==14?SCOUT_CONTROL:k==21?SCOUT_REMOTE_ID:k>=23?SCOUT_SIGNAL_CAL:SCOUT_SCAN_PAGE;
+        if(k==19) scout.start_page=1;
+        if(k==20) scout.channel=3;
+        if(k==22){scout.rechecking=true;scout.recheck_channel=3;}
         scout.scan.mode=k==0?FPV_SCAN:k==1?FPV_VERIFY:k==2?FPV_HIT:FPV_LOCK;
         scout.scan.last_sync=k==4?0:1000000;
         scout.spectrum_valid=true;scout.floor_est=-3000;
         scout.spectrum_updated=1000000;
         scout.lq_history=0xffbf;scout.lq_samples=16;
-        scout.video_live=k==2 || k==3 || k==10;scout.video_pal=true;
+        scout.video_live=k==2 || k==3 || k==10 || k==20 || k==22;scout.video_pal=true;
         for(int j=0;j<256;j++) {
             int d=j-128;if(d<0)d=-d;
             spec_bins[j]=-3000+(j*37%200)+(d<40?(40-d)*100:0);
@@ -157,7 +170,6 @@ int main(int argc,char **argv) {
             scout.tuner_mhz=5799;
             scout_draw_tuner();
         }
-        else if(scout.page==SCOUT_MENU) scout_draw_menu();
         else if(k==15 || k==16) {
             scout.page=SCOUT_SIGNAL_LOG;
             scout.log_selection=k==16?0:-1;
@@ -169,6 +181,40 @@ int main(int argc,char **argv) {
             scout_draw_signal_log(k==16?21000000:17000000);
         }
         else if(scout.page==SCOUT_SETTINGS) scout_draw_settings();
+        else if(scout.page==SCOUT_SIGNAL_CAL) {
+            if(k==24) scout.cal=(scout_signal_cal_t){
+                .tool=SCOUT_CAL_ANALOG,.stage=SCOUT_CAL_REVIEW,.baseline_ready=true,.saved_valid=true,
+                .result={.floor=-3090,.level=98,.mhz=5769,.signal=1,.quality=94},
+                .saved={.floor=-3210,.level=93,.mhz=5769,.signal=1,.quality=88},
+            };
+            if(k==25) scout.cal=(scout_signal_cal_t){
+                .tool=SCOUT_CAL_RID,.stage=SCOUT_CAL_REVIEW,
+                .result={.other_level=-59,.signal=2},
+            };
+            scout_draw_calibration(1000000);
+        }
+        else if(scout.page==SCOUT_MENU || scout.page==SCOUT_REMOTE_ID) {
+            if(k==17 || k==21) {
+                sample_rid=(scout_rid_state_t){.ble_enabled=true,.ble_window=true};
+                sample_rid.aircraft[0].packet=(scout_rid_packet_t){.transport=3,.rssi=-59,.id="TEST-RECEIVER-01"};
+                sample_rid.aircraft[0].seen=1000000;
+                scout_rid=&sample_rid;
+            }
+            if(scout.page==SCOUT_MENU) {
+                if(k==17) {
+                    scout.all.analog_channel=3;
+                    scout.all.analog_at=1000000;
+                    scout.all.digital.shown=(scout_rf_hit_t){5820,15000,2500,SCOUT_RF_UNKNOWN};
+                    scout.all.phase=SCOUT_ALL_RID;
+                    scout.control.elrs_hops=2;
+                    scout.control.elrs_at=1000000;
+                }
+                scout_draw_all(2000000);
+            } else {
+                scout.dirty=true;
+                scout_draw_remote_id(2000000);
+            }
+        }
         else if(scout.page==SCOUT_CONTROL) {
             scout.control.elrs_hops=2;
             scout.control.elrs_sf=7;
@@ -221,11 +267,11 @@ int main(int argc,char **argv) {
         const uint16_t bg=CYD_RGB(10,14,20);
         scout.page=SCOUT_MENU;
         wallpaper_mode=CYD_WALLPAPER_MAIN;
-        scout_draw_menu();
+        scout_draw_all(1000000);
         assert(canvas[0]==CYD_BLUE);
-        assert(canvas[(SCOUT_MENU_SCAN_Y+12)*cyd_width()+cyd_width()-22]==CYD_RGB(17,24,35));
+        assert(canvas[(SCOUT_ALL_ROW_Y+12)*cyd_width()+cyd_width()-22]==CYD_RGB(17,24,35));
         wallpaper_mode=CYD_WALLPAPER_OFF;
-        scout_draw_menu();
+        scout_draw_all(1000000);
         assert(canvas[0]==bg);
         scout.page=SCOUT_SETTINGS;
         wallpaper_mode=CYD_WALLPAPER_MAIN;

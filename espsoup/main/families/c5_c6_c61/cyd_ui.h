@@ -16,6 +16,7 @@
 #include "scout_log_storage.h"
 #include "scout_indicator.h"
 #include "scout_remote_id.h"
+#include "scout_signal_cal.h"
 #include "composite/bench.h"
 
 typedef struct { const char *name; unsigned mhz; } scout_channel_t;
@@ -31,10 +32,14 @@ static const scout_channel_t scout_channels[] = {
 #define SCOUT_CHANNELS_PER_BAND 8
 enum { SCOUT_CONTENDERS=3, SCOUT_COMPARE_ROUNDS=2, SCOUT_COMPARE_DWELL_US=45000 };
 enum { SCOUT_COMPARE_VIDEO_US=12000, SCOUT_COMPARE_VIDEO_MIN=4, SCOUT_NEARBY_MHZ=6 };
+enum { SCOUT_RECHECK_LQ=81, SCOUT_RECHECK_GAIN=12, SCOUT_RECHECK_MIN_CHECKS=6 };
+#define SCOUT_RECHECK_BAD_US 600000LL
+#define SCOUT_RECHECK_MAX_US 1200000LL
+#define SCOUT_RECHECK_COOLDOWN_US 10000000LL
 typedef struct {
     fpv_scan_t sync;
     int32_t strength;
-    unsigned channel, h_pairs, observations, clean_lines, video_checks;
+    unsigned channel, h_pairs, observations, valid_h, clean_lines, video_checks;
 } scout_candidate_t;
 #define SCOUT_SYNC_TIMEOUT_US 5000000LL
 #define SCOUT_VIDEO_RECENT_US 250000LL
@@ -54,11 +59,32 @@ typedef struct {
     unsigned passes, errors;
     scout_control_reading_t elrs, dji;
 } scout_control_t;
+
+enum { SCOUT_ALL_ANALOG, SCOUT_ALL_DIGITAL, SCOUT_ALL_CONTROL, SCOUT_ALL_RID };
+#define SCOUT_ALL_RID_US 4100000LL
+#define SCOUT_ALL_ANALOG_AGE_US 16000000LL
+typedef struct {
+    unsigned phase, analog_channel;
+    int analog_polarity;
+    int64_t analog_at, rid_until;
+    scout_rf_track_t digital;
+} scout_all_t;
+
+static const struct { unsigned page; uint8_t stored; const char *label; } scout_start_pages[] = {
+    {SCOUT_MENU, 1, "Main Menu"}, {SCOUT_SCAN_PAGE, 0, "Video Scan"},
+    {SCOUT_CONTROL, 3, "Control Links"}, {SCOUT_REMOTE_ID, 4, "Remote ID"},
+    {SCOUT_SPECTRUM, 5, "Spectrum"}, {SCOUT_SIGNAL_LOG, 6, "Signal Log"}, {SCOUT_SETTINGS, 7, "Settings"},
+};
+#define SCOUT_START_PAGE_COUNT (sizeof(scout_start_pages) / sizeof(scout_start_pages[0]))
+
 static struct {
     bool up, host, dirty, touching, boot_down, tuned, manual, auto_rescan;
     uint8_t lq_samples;
     uint16_t lq_history;
     unsigned page, log_page;
+    uint8_t start_page;
+    scout_all_t all;
+    scout_signal_cal_t cal;
     bool spectrum_valid, video_live, video_pal, video_full;
     uint8_t video_full_state;
     int32_t floor_est;
@@ -78,9 +104,11 @@ static struct {
     int log_selection;
     char log_status[40];
     int64_t rid_log_seen[2];
-    scout_candidate_t candidates[SCOUT_CONTENDERS];
+    scout_candidate_t candidates[SCOUT_CONTENDERS + 1];
     unsigned candidate_count, compare_index, compare_round, last_compared;
-    bool comparing;
+    bool comparing, rechecking;
+    unsigned recheck_channel;
+    int64_t recheck_bad_at, recheck_after;
     int64_t compare_start, compare_until, compare_next_video, compare_us, lock_us;
     int64_t last_draw, sweep_start, sweep_us, sweep_label_at, next_check, hold_started;
     int16_t *bins;
@@ -89,10 +117,13 @@ static struct {
 
 static scout_channel_t scout_current_channel(void) {
     if (scout.manual_mhz) return (scout_channel_t){"Custom", scout.manual_mhz};
-    return scout_channels[scout.channel];
+    return scout_channels[scout.rechecking ? scout.recheck_channel : scout.channel];
 }
 
 static const char *const scout_wallpaper_modes[] = {"MAIN", "ALL", "OFF"};
+static const char *const scout_cal_names[] = {
+    "Signal Calibration", "Analog Video", "Digital Video", "Control Links", "Remote ID",
+};
 
 static unsigned scout_control_probability(const scout_control_reading_t *signal, unsigned passes) {
     unsigned count = passes < 8 ? passes : 8;
@@ -126,6 +157,7 @@ static int32_t scout_rssi(int64_t now) {
 }
 
 static void scout_log_analog(int64_t now) {
+    if (scout.page == SCOUT_SIGNAL_CAL) return;
     const int32_t strength = scout_rssi(now);
     scout_log_record(SCOUT_LOG_ANALOG, scout_current_channel().mhz,
                      strength == INT32_MIN ? SCOUT_LOG_NO_LEVEL : strength / 100, now);
@@ -152,7 +184,7 @@ static bool scout_single_scan_action(void) {
 }
 
 static void scout_tune(void) {
-    frequency_mhz = scout_current_channel().mhz;
+    frequency_mhz = scout.manual_mhz ? scout.manual_mhz : scout_channels[scout.channel].mhz;
     c5_khz_offset = 0;
     rx_analog_filter = rx_bandwidth_dcap(20);
     rx_channel_mode = rx_bandwidth_phy_mode(20);
@@ -181,6 +213,8 @@ static void scout_clear_signal(void) {
     scout.lq_history = scout.lq_samples = 0;
     scout.digital = (scout_rf_track_t){0};
     scout.comparing = false;
+    scout.rechecking = false;
+    scout.recheck_bad_at = scout.recheck_after = 0;
     scout.candidate_count = 0;
     scout.sweep_start = scout.sweep_label_at = 0;
     fpv_resume(&scout.scan);
@@ -193,6 +227,29 @@ static void scout_start_auto(bool skip_current) {
     scout.manual_mhz = 0;
     scout.channel = 0;
     scout_clear_signal();
+}
+
+static void scout_start_recheck(int64_t now) {
+    cyd_indicator_rate(0);
+    scout.rechecking = true;
+    scout.recheck_channel = scout.channel;
+    scout.channel = 0;
+    scout.candidate_count = 0;
+    scout.sweep_start = now;
+    scout.recheck_bad_at = 0;
+    scout.tuned = false;
+    scout.dirty = true;
+}
+
+static bool scout_recheck_due(int64_t now) {
+    if (scout.manual || !scout.auto_rescan || scout.scan.mode != FPV_LOCK ||
+        scout.lq_samples < 16 || scout_lq() > SCOUT_RECHECK_LQ || !scout.scan.last_sync ||
+        now - scout.scan.last_sync >= 1000000) {
+        scout.recheck_bad_at = 0;
+        return false;
+    }
+    if (!scout.recheck_bad_at) scout.recheck_bad_at = now;
+    return now >= scout.recheck_after && now - scout.recheck_bad_at >= SCOUT_RECHECK_BAD_US;
 }
 
 static void scout_step_manual(bool previous) {
@@ -259,12 +316,20 @@ static void scout_button(int x) {
     }
 }
 
+static void scout_cal_clear(void) {
+    free(scout.cal.quiet_plot);
+    scout.cal = (scout_signal_cal_t){0};
+}
+
 static void scout_open_page(unsigned page) {
     if (scout.page == SCOUT_BENCH && !scout_bench_close()) {
         scout.dirty = true;
         return;
     }
-    if (scout.page == SCOUT_REMOTE_ID) scout_rid_stop();
+    const bool from_menu = scout.page == SCOUT_MENU;
+    if (scout.page == SCOUT_REMOTE_ID || scout.page == SCOUT_SIGNAL_CAL ||
+        (from_menu && page != SCOUT_REMOTE_ID)) scout_rid_stop();
+    if (scout.page == SCOUT_SIGNAL_CAL || page == SCOUT_SIGNAL_CAL) scout_cal_clear();
     if (scout.page == SCOUT_SPECTRUM || scout.page == SCOUT_SCAN_PAGE || scout.page == SCOUT_CONTROL) {
         free(scout.waterfall);
         scout.waterfall = NULL;
@@ -278,7 +343,8 @@ static void scout_open_page(unsigned page) {
         scout.log_status[0] = '\0';
         if (scout_log_dirty) scout_log_urgent = true;
     }
-    if (page == SCOUT_CONTROL) scout.control = (scout_control_t){0};
+    if ((page == SCOUT_CONTROL && !from_menu) || page == SCOUT_MENU)
+        scout.control = (scout_control_t){0};
     scout.tuner_open = false;
     scout.spectrum_valid = false;
     scout.spectrum_held = false;
@@ -291,11 +357,16 @@ static void scout_open_page(unsigned page) {
     scout.spectrum_updated = 0;
     scout.skipped_mhz = 0;
     if (page == SCOUT_SCAN_PAGE && !scout.manual) scout.channel = 0;
-    scout_clear_signal();
+    if (page != SCOUT_MENU) scout_clear_signal();
     if (page == SCOUT_BENCH) scout_bench_open();
     if (page == SCOUT_REMOTE_ID) {
-        scout.rid_log_seen[0] = scout.rid_log_seen[1] = 0;
+        if (!from_menu) scout.rid_log_seen[0] = scout.rid_log_seen[1] = 0;
         scout_rid_start();
+    }
+    if (page == SCOUT_MENU) {
+        scout.all = (scout_all_t){0};
+        scout.rid_log_seen[0] = scout.rid_log_seen[1] = 0;
+        scout_start_auto(false);
     }
 }
 static void scout_load_rescan(void) {
@@ -322,15 +393,64 @@ static void scout_toggle_rescan(void) {
         printf("SCOUT auto rescan save failed: %d\n", (int)err);
     }
 }
+static void scout_load_start_page(void) {
+    nvs_handle_t nvs;
+    uint8_t choice = 1;
+    if (nvs_open("cyd", NVS_READONLY, &nvs) == ESP_OK) {
+        if (nvs_get_u8(nvs, "start_page", &choice) != ESP_OK) choice = 1;
+        nvs_close(nvs);
+    }
+    /* Scan All and Main Menu were separate choices in 1.18.0. */
+    if (choice == 2) choice = 1;
+    scout.start_page = 0;
+    for (unsigned i = 0; i < SCOUT_START_PAGE_COUNT; ++i)
+        if (scout_start_pages[i].stored == choice) scout.start_page = i;
+}
+
+static void scout_next_start_page(void) {
+    const uint8_t next = (scout.start_page + 1) % SCOUT_START_PAGE_COUNT;
+    nvs_handle_t nvs;
+    if (nvs_open("cyd", NVS_READWRITE, &nvs) != ESP_OK) return;
+    esp_err_t err = nvs_set_u8(nvs, "start_page", scout_start_pages[next].stored);
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    nvs_close(nvs);
+    if (err == ESP_OK) {
+        scout.start_page = next;
+        scout.dirty = true;
+    }
+}
+
+static void scout_open_video_result(bool digital) {
+    const int64_t now = esp_timer_get_time();
+    const bool analog = !digital && scout.all.analog_at &&
+                        now - scout.all.analog_at < SCOUT_ALL_ANALOG_AGE_US;
+    const unsigned mhz = digital ? scout.all.digital.shown.mhz : 0;
+    scout.manual = mhz != 0;
+    scout.manual_mhz = mhz;
+    scout_open_page(SCOUT_SCAN_PAGE);
+    if (analog) {
+        scout.channel = scout.all.analog_channel;
+        scout.scan = (fpv_scan_t){.mode=FPV_VERIFY, .polarity=scout.all.analog_polarity,
+                                   .deadline=esp_timer_get_time()+400000};
+    }
+    if (mhz) {
+        scout.digital = scout.all.digital;
+        scout.digital.best = (scout_rf_hit_t){0};
+    }
+}
+
 static void scout_navigation_action(int action) {
     switch(action) {
     case SCOUT_NAV_MENU: scout_open_page(SCOUT_MENU); break;
     case SCOUT_NAV_SCAN: scout_open_page(SCOUT_SCAN_PAGE); break;
+    case SCOUT_NAV_HOME_ANALOG: scout_open_video_result(false); break;
+    case SCOUT_NAV_HOME_DIGITAL: scout_open_video_result(true); break;
     case SCOUT_NAV_CONTROL: scout_open_page(SCOUT_CONTROL); break;
     case SCOUT_NAV_REMOTE_ID: scout_open_page(SCOUT_REMOTE_ID); break;
     case SCOUT_NAV_SIGNAL_LOG: scout_open_page(SCOUT_SIGNAL_LOG); break;
     case SCOUT_NAV_SPECTRUM: scout_open_page(SCOUT_SPECTRUM); break;
     case SCOUT_NAV_SETTINGS: scout_open_page(SCOUT_SETTINGS); break;
+    case SCOUT_NAV_SIGNAL_CAL: scout_open_page(SCOUT_SIGNAL_CAL); break;
     case SCOUT_NAV_BENCH: scout_open_page(SCOUT_BENCH); break;
     case SCOUT_NAV_SCAN_DISPLAY:
         if (scout.waterfall) {
@@ -341,6 +461,7 @@ static void scout_navigation_action(int action) {
     case SCOUT_NAV_CALIBRATE: cyd_touch_calibrate(true); scout.dirty=true; break;
     case SCOUT_NAV_LED_TEST: cyd_indicator_test(); break;
     case SCOUT_NAV_AUTO_RESCAN: scout_toggle_rescan(); break;
+    case SCOUT_NAV_START_PAGE: scout_next_start_page(); break;
     case SCOUT_NAV_WALLPAPER:
         cyd_wallpaper_next_file();
         scout.dirty = true;
@@ -488,6 +609,119 @@ static void scout_toggle_fullscreen(void) {
     scout.dirty = true;
 }
 
+static const char *const scout_cal_keys[] = {
+    "", "sigcal_ana_v1", "sigcal_dig_v1", "sigcal_ctl_v1", "sigcal_rid_v1",
+};
+
+static void scout_cal_select(unsigned tool) {
+    scout_cal_clear();
+    scout.cal.tool = tool;
+    nvs_handle_t nvs;
+    if (nvs_open("cyd", NVS_READONLY, &nvs) == ESP_OK) {
+        size_t size = sizeof(scout.cal.saved);
+        esp_err_t err = nvs_get_blob(nvs, scout_cal_keys[tool], &scout.cal.saved, &size);
+        nvs_close(nvs);
+        scout.cal.saved_valid = err == ESP_OK && size == sizeof(scout.cal.saved) &&
+                                scout.cal.saved.signal > 0 && scout.cal.saved.signal <= 3 &&
+                                scout.cal.saved.quality <= 100;
+    }
+    scout.dirty = true;
+}
+
+static void scout_cal_save(void) {
+    scout_signal_cal_t *cal = &scout.cal;
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open("cyd", NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        err = nvs_set_blob(nvs, scout_cal_keys[cal->tool], &cal->result, sizeof(cal->result));
+        if (err == ESP_OK) err = nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+    cal->save_failed = err != ESP_OK;
+    if (!cal->save_failed) {
+        cal->saved = cal->result;
+        cal->saved_valid = true;
+        cal->stage = SCOUT_CAL_SAVED;
+    }
+    scout.dirty = true;
+}
+
+static void scout_cal_finish(bool passed) {
+    if (scout.cal.tool == SCOUT_CAL_RID) scout_rid_stop();
+    scout.cal.stage = passed ? SCOUT_CAL_REVIEW : SCOUT_CAL_FAILED;
+    scout.dirty = true;
+}
+
+static void scout_cal_begin(void) {
+    scout_signal_cal_t *cal = &scout.cal;
+    scout.spectrum_step = 0;
+    scout.spectrum_valid = false;
+    cal->baseline_error = false;
+    cal->save_failed = false;
+    cal->next_sample = 0;
+    cal->result = (scout_cal_reference_t){.floor=cal->baseline_ready ? cal->result.floor : 0};
+    const int64_t now = esp_timer_get_time();
+    if (cal->tool != SCOUT_CAL_RID && !cal->baseline_ready) {
+        if (cal->tool == SCOUT_CAL_DIGITAL) {
+            if (!cal->quiet_plot)
+                cal->quiet_plot = heap_caps_malloc(sizeof(scout.spectrum_plot), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (!cal->quiet_plot) {
+                scout_cal_finish(false);
+                return;
+            }
+            for (unsigned i = 0; i < SCOUT_SPEC_W; ++i) cal->quiet_plot[i] = INT16_MIN;
+        }
+        cal->baseline_passes = 0;
+        cal->baseline_total = 0;
+        cal->stage = SCOUT_CAL_BASELINE;
+        cal->deadline = now + 3000000;
+    } else {
+        cal->stage = SCOUT_CAL_CHECK;
+        cal->deadline = now + (cal->tool == SCOUT_CAL_RID ? 24000000 : 12000000);
+        switch (cal->tool) {
+        case SCOUT_CAL_ANALOG: scout_start_auto(false); break;
+        case SCOUT_CAL_DIGITAL: scout.digital = (scout_rf_track_t){0}; break;
+        case SCOUT_CAL_CONTROL: scout.control = (scout_control_t){0}; break;
+        case SCOUT_CAL_RID:
+            scout_rid_start();
+            if (!scout_rid) scout_cal_finish(false);
+            break;
+        }
+    }
+    scout.dirty = true;
+}
+
+static void scout_cal_input(int x, int y) {
+    scout_signal_cal_t *cal = &scout.cal;
+    if (x >= 8 && x < 66 && y >= 6 && y < 34) {
+        if (cal->tool == SCOUT_CAL_MENU) scout_open_page(SCOUT_SETTINGS);
+        else {
+            if (cal->tool == SCOUT_CAL_RID) scout_rid_stop();
+            scout_cal_clear();
+            scout.dirty = true;
+        }
+        return;
+    }
+    if (x < 16 || x >= cyd_width() - 16) return;
+    if (cal->tool == SCOUT_CAL_MENU) {
+        const int row = y - SCOUT_CAL_ROW_Y;
+        if (row >= 0 && row < 4 * SCOUT_CAL_ROW_PITCH && row % SCOUT_CAL_ROW_PITCH < SCOUT_CAL_ROW_H)
+            scout_cal_select(SCOUT_CAL_ANALOG + row / SCOUT_CAL_ROW_PITCH);
+        return;
+    }
+    if (y < SCOUT_BUTTON_Y || y >= SCOUT_BUTTON_Y + SCOUT_BUTTON_H) return;
+    switch (cal->stage) {
+    case SCOUT_CAL_SETUP:
+    case SCOUT_CAL_READY:
+    case SCOUT_CAL_FAILED: scout_cal_begin(); break;
+    case SCOUT_CAL_CHECK:
+        if (cal->tool == SCOUT_CAL_RID && cal->result.signal) scout_cal_finish(true);
+        break;
+    case SCOUT_CAL_REVIEW: scout_cal_save(); break;
+    case SCOUT_CAL_SAVED: scout_cal_select(cal->tool); break;
+    }
+}
+
 static void scout_input(void) {
     int x, y;
     bool down = cyd_touch(&x, &y);
@@ -495,6 +729,8 @@ static void scout_input(void) {
         scout_tuner_input(x, y);
     } else if (down && !scout.touching && scout.page == SCOUT_SIGNAL_LOG) {
         scout_log_input(x,y);
+    } else if (down && !scout.touching && scout.page == SCOUT_SIGNAL_CAL) {
+        scout_cal_input(x,y);
     } else if (down && !scout.touching && scout.page == SCOUT_SCAN_PAGE &&
         (scout.video_full || (scout.video_live && y >= SCOUT_VIDEO_Y && y < SCOUT_VIDEO_Y + SCOUT_VIDEO_H))) {
         scout_toggle_fullscreen();
@@ -654,15 +890,43 @@ static void scout_draw_scan_plot(void) {
     scout.scan_plot_dirty = false;
 }
 #ifdef SCOUT_RUST_CORE
+static bool scout_cal_analog_sync(unsigned mhz) {
+    const unsigned saved_freq = frequency_mhz, saved_mode = rx_channel_mode;
+    const int saved_filter = rx_analog_filter;
+    frequency_mhz = mhz;
+    rx_channel_mode = rx_bandwidth_phy_mode(20);
+    rx_analog_filter = rx_bandwidth_dcap(20);
+    rx_ready = false;
+    prepare_rx();
+    bool analog = false;
+    for (unsigned i = 0; i < 2 && !analog; ++i) {
+        uint32_t elapsed;
+        if (!fast_capture(FPV_SAMPLES,2,&elapsed)) {
+            const fpv_evidence_t e = fpv_detect(DUMP_BUF,scout.bins);
+            analog = e.h_pairs >= 4 || e.v_pairs >= 2;
+        }
+    }
+    frequency_mhz = saved_freq;
+    rx_channel_mode = saved_mode;
+    rx_analog_filter = saved_filter;
+    rx_ready = false;
+    prepare_rx();
+    return analog;
+}
+
 static void scout_rf_probe(unsigned centre) {
-    if (scout.page != SCOUT_SCAN_PAGE || scout.comparing || scout.scan.mode != FPV_SCAN ||
-        scout.candidate_count) return;
+    const bool cal_digital = scout.page == SCOUT_SIGNAL_CAL && scout.cal.tool == SCOUT_CAL_DIGITAL &&
+                             scout.cal.stage == SCOUT_CAL_CHECK;
+    if (!cal_digital && scout.page != SCOUT_MENU && (scout.page != SCOUT_SCAN_PAGE || scout.comparing ||
+        scout.scan.mode != FPV_SCAN || scout.candidate_count)) return;
 
     scout_rf_shape_t shape;
     scout_rf_shape(spec_bins, &shape);
     if (!shape.width_khz) return;
     const int estimate = (int)centre * 1000 + shape.offset_khz;
     const unsigned mhz = (estimate + 500) / 1000;
+    if (cal_digital && !scout_cal_peak_rise(scout.cal.quiet_plot,scout.spectrum_work,
+        scout_frequency_x((int)mhz*1000-3000),scout_frequency_x((int)mhz*1000+3000))) return;
     if (mhz < 5650 || mhz > 5925) return;
     if (scout.manual) {
         const unsigned tuned = scout_current_channel().mhz;
@@ -693,7 +957,8 @@ static void scout_rf_probe(unsigned centre) {
         if (match == SCOUT_TIMING_O4) kind = SCOUT_RF_O4;
         if (match == SCOUT_TIMING_AVATAR) kind = SCOUT_RF_AVATAR;
     }
-    scout_rf_hit_t *best = &scout.digital.best;
+    if (cal_digital && kind == SCOUT_RF_UNKNOWN && scout_cal_analog_sync(mhz)) return;
+    scout_rf_hit_t *best = scout.page == SCOUT_MENU ? &scout.all.digital.best : &scout.digital.best;
     const bool named = kind > SCOUT_RF_UNKNOWN, best_named = best->kind > SCOUT_RF_UNKNOWN;
     if ((named && !best_named) || (named == best_named && shape.contrast > best->contrast))
         *best = (scout_rf_hit_t){mhz, shape.width_khz, shape.contrast, kind};
@@ -704,7 +969,8 @@ static void scout_spectrum_step(int64_t now) {
     if (!scout.spectrum_step) for(unsigned x=0;x<SCOUT_SPEC_W;x++) scout.spectrum_work[x]=INT16_MIN;
     unsigned saved_freq=frequency_mhz, saved_mode=rx_channel_mode;
     int saved_filter=rx_analog_filter;
-    const bool band24 = scout.page == SCOUT_CONTROL || (scout.page == SCOUT_SPECTRUM && scout.spectrum_24);
+    const bool band24 = scout.page == SCOUT_CONTROL || (scout.page == SCOUT_SPECTRUM && scout.spectrum_24) ||
+                        (scout.page == SCOUT_SIGNAL_CAL && scout.cal.tool == SCOUT_CAL_CONTROL);
     const unsigned low = band24 ? SCOUT_BAND_24_LOW : SCOUT_BAND_LOW;
     const unsigned high = band24 ? SCOUT_BAND_24_HIGH : SCOUT_BAND_HIGH;
     const unsigned chunks = (high - low + SCOUT_SWEEP_KEEP - 1) / SCOUT_SWEEP_KEEP;
@@ -713,6 +979,7 @@ static void scout_spectrum_step(int64_t now) {
     rx_analog_filter=rx_bandwidth_dcap(40); rx_ready=false; prepare_rx();
     uint32_t elapsed;
     const char *err=spec_compute(1,256,4,spec_bins,&elapsed);
+    if (err && scout.page == SCOUT_SIGNAL_CAL) scout.cal.baseline_error = true;
     if (!err && band24) {
         const int bandwidth = (SCOUT_BAND_24_HIGH - SCOUT_BAND_24_LOW) * 1000;
         for (int j = 32; j < 224; j++) {
@@ -738,12 +1005,16 @@ static void scout_spectrum_step(int64_t now) {
         scout.spectrum_updated=now;
         if(scout.spectrum_valid) scout.floor_est=floor;
         scout.spectrum_step=0;
-        if (scout.page == SCOUT_SCAN_PAGE) {
-            const scout_rf_hit_t observed = scout.digital.best;
-            const scout_rf_hit_t before = scout.digital.shown;
-            if (scout_rf_finish_sweep(&scout.digital)) scout.dirty = true;
-            const scout_rf_hit_t shown = scout.digital.shown;
-            if (observed.kind && scout.digital.seen >= 2 && shown.kind)
+        if (scout.page == SCOUT_SIGNAL_CAL && scout.cal.tool == SCOUT_CAL_DIGITAL &&
+            scout.cal.stage == SCOUT_CAL_CHECK) {
+            scout_rf_finish_sweep(&scout.digital);
+        } else if (scout.page == SCOUT_SCAN_PAGE || scout.page == SCOUT_MENU) {
+            scout_rf_track_t *track = scout.page == SCOUT_MENU ? &scout.all.digital : &scout.digital;
+            const scout_rf_hit_t observed = track->best;
+            const scout_rf_hit_t before = track->shown;
+            if (scout_rf_finish_sweep(track)) scout.dirty = true;
+            const scout_rf_hit_t shown = track->shown;
+            if (observed.kind && track->seen >= 2 && shown.kind)
                 scout_log_record(SCOUT_LOG_DIGITAL + shown.kind - SCOUT_RF_UNKNOWN, shown.mhz, observed.contrast / 100, now);
             if (!observed.kind && !shown.kind && before.kind)
                 scout_log_lost(SCOUT_LOG_DIGITAL + before.kind - SCOUT_RF_UNKNOWN, before.mhz, now);
@@ -826,10 +1097,10 @@ static void scout_draw(int64_t now) {
     bool recovering = locked && scout.scan.last_sync &&
         (sync ? sv_v.last_row_us && now - sv_v.last_row_us >= 1000000 :
                 now - scout.scan.last_sync < sv_FRAME_HOLD_US);
-    bool error = scout.errors >= 3, lost = locked && (!sync || recovering);
+    bool error = scout.errors >= 3, lost = locked && (!sync || recovering || scout.rechecking);
     uint16_t accent = error || lost ? amber : teal;
     uint16_t pill = error || lost ? CYD_RGB(57,40,23) : CYD_RGB(17,48,44);
-    const char *status = error ? "Error" : scout.comparing ? "Comparing" : hit ? "Detected" : locked ? (recovering ? "Recovering" : sync ? "Locked" : scout.scan.last_sync ? "Sync lost" : "Checking") : mode == FPV_VERIFY ? "Checking" : scout.manual ? "Manual" : "Scanning";
+    const char *status = scout.rechecking ? "Rechecking" : error ? "Error" : scout.comparing ? "Comparing" : hit ? "Detected" : locked ? (recovering ? "Recovering" : sync ? "Locked" : scout.scan.last_sync ? "Sync lost" : "Checking") : mode == FPV_VERIFY ? "Checking" : scout.manual ? "Manual" : "Scanning";
     bool ready = scout_wallpaper_visible() && cyd_frame_ready();
     bool animated = ready && cyd_wallpaper_update(now);
     bool refresh = scout.dirty || !scout.last_draw || animated;
@@ -872,7 +1143,7 @@ static void scout_draw(int64_t now) {
     const int pill_w = locked ? 110 : 78, pill_x = width - pill_w - 12;
     char rssi[12], lq[8], link[32], strength[20] = "";
     int status_y = 12;
-    if (locked && sync && !recovering && !error) {
+    if (locked && sync && !recovering && !error && !scout.rechecking) {
         scout_signal_labels(now, rssi, lq);
         snprintf(link, sizeof(link), "%s LQ %s", status, lq);
         snprintf(strength, sizeof(strength), "RSSI %s", rssi);
@@ -969,68 +1240,6 @@ static void scout_draw_tuner(void) {
     scout.dirty = false;
 }
 
-static void scout_draw_menu(void) {
-    const bool landscape = cyd_landscape();
-    const int width = cyd_width(), height = cyd_height();
-    const uint16_t bg=CYD_RGB(10,14,20), card=CYD_RGB(17,24,35);
-    const uint16_t white=CYD_RGB(238,243,250), muted=CYD_RGB(145,161,182);
-    const uint16_t teal=CYD_RGB(64,218,190);
-    const int title_y = landscape ? 5 : 15, subtitle_y = landscape ? 28 : 43;
-    const int version_y = height - (landscape ? 16 : 24);
-    const int card_h = SCOUT_MENU_CARD_H;
-    const struct {
-        int y, h;
-        const char *title;
-        uint16_t fg;
-    } cards[] = {
-        {SCOUT_MENU_SCAN_Y, card_h, "Video Link Scanner", teal},
-        {SCOUT_MENU_CONTROL_Y, card_h, "Control Link Scanner", white},
-        {SCOUT_MENU_SPECTRUM_Y, card_h, "SPECTRUM", white},
-        {SCOUT_MENU_SETTINGS_Y, card_h, "SETTINGS", white},
-        {SCOUT_MENU_REMOTE_ID_Y, card_h, "RemoteID Check", white},
-        {SCOUT_MENU_BENCH_Y, card_h, "Composite Bench", white},
-    };
-    const bool wallpaper = scout_wallpaper_visible();
-    uint16_t *band = cyd_band();
-    /* Compose each strip before sending it so the menu cards never blink between GIF frames. */
-    for (int y = 0; y < height; y += CYD_BAND_LINES) {
-        int rows = height - y < CYD_BAND_LINES ? height - y : CYD_BAND_LINES;
-        for (int r = 0; r < rows; r++) {
-            int yy = y + r;
-            uint16_t *row = band + r * width;
-            if (wallpaper) cyd_wallpaper_row(row, width, height, yy);
-            else for (int x = 0; x < width; x++) row[x] = bg;
-
-            cyd_label_overlay_row(row,0,yy,width,16,title_y,"FPV Scout",white,CYD_FONT_TITLE);
-            cyd_label_overlay_row(row,0,yy,width,16,subtitle_y,"RF receiver",muted,CYD_FONT_UI);
-            cyd_label_overlay_row(row,0,yy,width,16,version_y,SCOUT_VERSION_LABEL,muted,CYD_FONT_SMALL);
-            const int log_x = SCOUT_LOG_BUTTON_X(width), log_y = SCOUT_LOG_BUTTON_Y;
-            if (yy >= log_y && yy < log_y + SCOUT_LOG_BUTTON_H) {
-                const int mid = yy - log_y, end = log_y + SCOUT_LOG_BUTTON_H - 1 - yy;
-                const int edge = mid < end ? mid : end;
-                const int inset = edge < 7 ? scout_corner_inset(7, edge) : 0;
-                for (int x = log_x + inset; x < log_x + SCOUT_LOG_BUTTON_W - inset; ++x) row[x] = card;
-                cyd_label_overlay_row(row,0,yy,width,log_x+12,log_y+5,"Signal Log",white,CYD_FONT_UI);
-            }
-            for (unsigned i = 0; i < sizeof(cards) / sizeof(cards[0]); i++) {
-                int cy = yy - cards[i].y;
-                if (cy < 0 || cy >= cards[i].h) continue;
-                int radius = 8;
-                int edge = cards[i].h - 1 - cy;
-                if (cy < edge) edge = cy;
-                int inset = edge < radius ? scout_corner_inset(radius, edge) : 0;
-                for (int x = 16 + inset; x < width - 16 - inset; x++) row[x] = card;
-                int offset = (cards[i].h - 18) / 2;
-                cyd_label_overlay_row(row,0,yy,width,30,cards[i].y+offset,cards[i].title,
-                                      cards[i].fg,CYD_FONT_UI);
-                cyd_label_overlay_row(row,0,yy,width,width-40,cards[i].y+offset,">",cards[i].fg,CYD_FONT_UI);
-            }
-        }
-        cyd_blit(0,y,width,rows,band);
-    }
-    scout.dirty=false;
-}
-
 static void scout_log_time(char text[32], uint32_t boot, uint32_t seconds) {
     if (!boot) { strcpy(text,"Unknown"); return; }
     snprintf(text,32,"Boot %lu / %02lu:%02lu:%02lu",(unsigned long)boot,
@@ -1124,36 +1333,177 @@ static void scout_draw_settings(void) {
     const uint16_t bg=CYD_RGB(10,14,20), button=CYD_RGB(27,38,54);
     const uint16_t white=CYD_RGB(238,243,250), muted=CYD_RGB(145,161,182);
     bool buffered = scout_wallpaper_visible() && cyd_frame_begin();
-    const char *band = "5.362 - 5.945 GHz";
     const scout_bg_label_t labels[] = {
         {78,8,"Settings",white,CYD_FONT_TITLE},
-        {landscape ? width-16-cyd_label_width(band,CYD_FONT_SMALL) : 16,
-         landscape ? 13 : 277,band,muted,CYD_FONT_SMALL},
-        {16,130,"Wallpaper",muted,CYD_FONT_SMALL},
-        {16,cyd_height()-(landscape ? 13 : 19),cyd_wallpaper_status(),muted,CYD_FONT_SMALL},
+        {16,cyd_height()-13,cyd_wallpaper_status(),muted,CYD_FONT_SMALL},
     };
     scout_background(0,cyd_height(),bg,labels,sizeof(labels) / sizeof(labels[0]));
     scout_round(8,6,58,28,7,button);
     scout_center(8,11,58,"Back",white,button);
-    scout_round(16,SCOUT_RESCAN_Y,card_w,SCOUT_SETTING_H,9,button);
+    scout_round(16,SCOUT_RESCAN_Y,utility_w,SCOUT_SETTING_H,9,button);
     cyd_label(28,SCOUT_RESCAN_Y+9,"Auto rescan",muted,button,CYD_FONT_UI);
-    const char *rescan = scout.auto_rescan ? "ON" : "OFF";
-    cyd_label(width-33-cyd_label_width(rescan,CYD_FONT_UI),SCOUT_RESCAN_Y+9,rescan,white,button,CYD_FONT_UI);
+    const char *rescan = scout.auto_rescan ? "On" : "Off";
+    cyd_label(16+utility_w-12-cyd_label_width(rescan,CYD_FONT_UI),SCOUT_RESCAN_Y+9,rescan,white,button,CYD_FONT_UI);
+    const int start_x = landscape ? right_x : 16, start_y = SCOUT_START_PAGE_Y(landscape);
+    const char *start = scout_start_pages[scout.start_page].label;
+    scout_round(start_x,start_y,utility_w,SCOUT_SETTING_H,9,button);
+    cyd_label(start_x+12,start_y+(landscape ? 3 : 9),"Start page",muted,button,
+              landscape ? CYD_FONT_SMALL : CYD_FONT_UI);
+    const int start_value_x = landscape ? start_x+12 : width-33-cyd_label_width(start,CYD_FONT_UI);
+    cyd_label(start_value_x,start_y+(landscape ? 16 : 9),start,white,button,CYD_FONT_UI);
     scout_round(16,SCOUT_ORIENTATION_Y,card_w,SCOUT_SETTING_H,9,button);
     cyd_label(28,SCOUT_ORIENTATION_Y+9,"Orientation",muted,button,CYD_FONT_UI);
     const char *orientation = landscape ? "Landscape" : "Portrait";
     cyd_label(width-33-cyd_label_width(orientation,CYD_FONT_UI),SCOUT_ORIENTATION_Y+9,
               orientation,white,button,CYD_FONT_UI);
+    scout_round(16,SCOUT_SIGNAL_CAL_Y,card_w,SCOUT_SETTING_H,9,button);
+    scout_center(16,SCOUT_SIGNAL_CAL_Y+7,card_w,"Signal Calibration",white,button);
     scout_round(16,SCOUT_WALLPAPER_Y,half_w,SCOUT_SETTING_H,9,button);
     scout_round(right_x,SCOUT_WALLPAPER_Y,half_w,SCOUT_SETTING_H,9,button);
-    scout_center(16,SCOUT_WALLPAPER_Y+9,half_w,scout_wallpaper_modes[cyd_wallpaper_mode()],white,button);
-    scout_center(right_x,SCOUT_WALLPAPER_Y+9,half_w,"Next image",white,button);
+    const char *const modes[] = {"Main", "All", "Off"};
+    const char *mode = modes[cyd_wallpaper_mode()];
+    cyd_label(16+(half_w-cyd_label_width("Wallpaper",CYD_FONT_SMALL))/2,SCOUT_WALLPAPER_Y+2,
+              "Wallpaper",muted,button,CYD_FONT_SMALL);
+    cyd_label(16+(half_w-cyd_label_width(mode,CYD_FONT_SMALL))/2,SCOUT_WALLPAPER_Y+16,
+              mode,white,button,CYD_FONT_SMALL);
+    scout_center(right_x,SCOUT_WALLPAPER_Y+7,half_w,"Next image",white,button);
     scout_round(16,SCOUT_CALIBRATE_Y,utility_w,SCOUT_SETTING_H,9,button);
     scout_center(16,SCOUT_CALIBRATE_Y+9,utility_w,"Calibrate touch",white,button);
     scout_round(test_x,test_y,utility_w,SCOUT_SETTING_H,9,button);
     scout_center(test_x,test_y+9,utility_w,"Test LED",white,button);
     if (buffered) cyd_frame_end(0,0);
     scout.dirty=false;
+}
+
+static void scout_cal_result_lines(unsigned tool, const scout_cal_reference_t *r,
+                                   char primary[48], char secondary[48]) {
+    switch (tool) {
+    case SCOUT_CAL_ANALOG:
+        snprintf(primary,48,"%u MHz   %s",r->mhz,r->signal == 1 ? "PAL" : "NTSC");
+        snprintf(secondary,48,"LQ %u%%   Picture %d%%",r->quality,r->level);
+        break;
+    case SCOUT_CAL_DIGITAL:
+        snprintf(primary,48,"%s   %u MHz",r->signal == SCOUT_RF_O4 ? "Likely DJI O4" :
+                 r->signal == SCOUT_RF_AVATAR ? "Likely Avatar" : "Unclassified RF",r->mhz);
+        snprintf(secondary,48,"Contrast %d dB",r->level / 100);
+        break;
+    case SCOUT_CAL_CONTROL:
+        snprintf(primary,48,"%s",r->signal == 1 ? "Likely ELRS" : "DJI-like activity");
+        snprintf(secondary,48,"RSSI %d dBFS   LQ %u%%",r->level,r->quality);
+        break;
+    case SCOUT_CAL_RID:
+        if (r->signal & 1) snprintf(primary,48,"Wi-Fi received   %d dBm",r->level);
+        else snprintf(primary,48,"Wi-Fi not seen");
+        if (r->signal & 2) snprintf(secondary,48,"Bluetooth received   %d dBm",r->other_level);
+        else snprintf(secondary,48,"Bluetooth not seen");
+        break;
+    }
+}
+
+static void scout_draw_calibration(int64_t now) {
+    const scout_signal_cal_t *cal = &scout.cal;
+    const unsigned tool = cal->tool, stage = cal->stage;
+    const int width = cyd_width(), height = cyd_height(), card_w = width - 32;
+    const uint16_t bg=CYD_RGB(10,14,20), button=CYD_RGB(27,38,54);
+    const uint16_t white=CYD_RGB(238,243,250), muted=CYD_RGB(145,161,182), teal=CYD_RGB(64,218,190);
+    const bool buffered = cyd_frame_begin();
+    const scout_bg_label_t title[] = {{77,8,scout_cal_names[tool],white,CYD_FONT_TITLE}};
+    scout_background(0,height,bg,title,1);
+    scout_round(8,6,58,28,7,button);
+    scout_center(8,11,58,"Back",white,button);
+
+    if (tool == SCOUT_CAL_MENU) {
+        for (unsigned i = SCOUT_CAL_ANALOG; i <= SCOUT_CAL_RID; ++i) {
+            const int y = SCOUT_CAL_ROW_Y + (int)(i - SCOUT_CAL_ANALOG) * SCOUT_CAL_ROW_PITCH;
+            scout_round(16,y,card_w,SCOUT_CAL_ROW_H,8,button);
+            scout_center(16,y+7,card_w,scout_cal_names[i],white,button);
+        }
+    } else {
+        const char *heading = "", *first = "", *second = "", *action = NULL;
+        char details[48] = "", measurement[48] = "", baseline[48] = "";
+        if (cal->baseline_ready) snprintf(baseline,sizeof(baseline),"Quiet floor %+d dB rel.",cal->result.floor / 100);
+        switch (stage) {
+        case SCOUT_CAL_SETUP:
+            if (tool == SCOUT_CAL_RID) {
+                heading = "Reference broadcast";
+                first = "Power on your Remote ID beacon.";
+                second = "Listen for Wi-Fi and Bluetooth.";
+                action = "Listen";
+            } else {
+                heading = "Quiet baseline";
+                first = tool == SCOUT_CAL_CONTROL ? "Switch off your test controller." : "Switch off your video transmitter.";
+                second = "Keep the receiver in place.";
+                action = "Measure baseline";
+            }
+            break;
+        case SCOUT_CAL_BASELINE:
+            heading = "Measuring quiet band";
+            snprintf(details,sizeof(details),"Sweep %u of 3",cal->baseline_passes+1);
+            first = details;
+            break;
+        case SCOUT_CAL_READY:
+            heading = "Reference signal";
+            first = tool == SCOUT_CAL_CONTROL ? "Power on your test controller." : "Power on your test video link.";
+            second = tool == SCOUT_CAL_DIGITAL ? "Wait for the link to connect." : "Keep the receiver in place.";
+            action = "Check signal";
+            break;
+        case SCOUT_CAL_CHECK:
+            heading = "Checking reference";
+            if (tool == SCOUT_CAL_ANALOG && scout.scan.mode == FPV_LOCK) {
+                const int lq = scout_lq();
+                if (lq >= 0) snprintf(details,sizeof(details),"%u MHz   LQ %d%%",scout_current_channel().mhz,lq);
+                else snprintf(details,sizeof(details),"%u MHz   Measuring sync",scout_current_channel().mhz);
+                first = details;
+            } else if (tool == SCOUT_CAL_RID) {
+                scout_cal_result_lines(tool,&cal->result,details,measurement);
+                first = details;
+                second = measurement;
+                if (cal->result.signal) action = "Use results";
+            } else {
+                first = "Listening for the reference signal.";
+            }
+            break;
+        case SCOUT_CAL_REVIEW:
+        case SCOUT_CAL_SAVED:
+            heading = stage == SCOUT_CAL_SAVED ? "Reference saved" :
+                      cal->save_failed ? "Save failed. Try again." : "Review reference";
+            scout_cal_result_lines(tool,&cal->result,details,measurement);
+            first = details;
+            second = measurement;
+            action = stage == SCOUT_CAL_SAVED ? "Run again" : "Save reference";
+            break;
+        case SCOUT_CAL_FAILED:
+            heading = tool == SCOUT_CAL_RID || cal->baseline_ready ?
+                      "Reference unconfirmed" : "Baseline unavailable";
+            first = tool == SCOUT_CAL_RID ? "Check that your beacon is active." :
+                    cal->baseline_ready ? "Check the link and try again." : "Try again with your source off.";
+            action = "Try again";
+            break;
+        }
+        char saved_primary[48] = "", saved_secondary[48] = "", saved_floor[42] = "";
+        if (cal->saved_valid && stage != SCOUT_CAL_SAVED) {
+            scout_cal_result_lines(tool,&cal->saved,saved_primary,saved_secondary);
+            if (tool != SCOUT_CAL_RID) snprintf(saved_floor,sizeof(saved_floor),"Saved quiet floor %+d dB rel.",cal->saved.floor / 100);
+        }
+        const scout_bg_label_t labels[] = {
+            {16,46,heading,teal,CYD_FONT_UI},
+            {16,69,first,white,CYD_FONT_SMALL},
+            {16,88,second,white,CYD_FONT_SMALL},
+            {16,109,baseline,muted,CYD_FONT_SMALL},
+            {16,134,saved_primary[0] ? "Saved reference" : "",teal,CYD_FONT_SMALL},
+            {16,151,saved_primary,muted,CYD_FONT_SMALL},
+            {16,168,saved_secondary,muted,CYD_FONT_SMALL},
+            {16,185,saved_floor,muted,CYD_FONT_SMALL},
+        };
+        scout_background(41,SCOUT_BUTTON_Y,bg,labels,sizeof(labels)/sizeof(labels[0]));
+        if (action) {
+            scout_round(16,SCOUT_BUTTON_Y,card_w,SCOUT_BUTTON_H,8,button);
+            scout_center(16,SCOUT_BUTTON_Y+7,card_w,action,white,button);
+        }
+    }
+    if (buffered) cyd_frame_end(0,0);
+    scout.last_draw = now;
+    scout.dirty = false;
 }
 
 static void scout_draw_remote_id(int64_t now) {
@@ -1198,6 +1548,63 @@ static void scout_draw_remote_id(int64_t now) {
     const int clear_from = top + (int)shown * pitch;
     const scout_bg_label_t idle[] = {{16,top+11,"No Remote ID broadcasts",muted,CYD_FONT_UI}};
     scout_background(clear_from,height,bg,idle,shown || !scout_rid ? 0 : 1);
+    if (buffered) cyd_frame_end(0,0);
+    scout.last_draw = now;
+    scout.dirty = false;
+}
+
+static void scout_draw_all(int64_t now) {
+    const bool landscape = cyd_landscape();
+    const int width = cyd_width(), height = cyd_height();
+    const uint16_t bg = CYD_RGB(10,14,20), button = CYD_RGB(27,38,54), card = CYD_RGB(17,24,35);
+    const uint16_t white = CYD_RGB(238,243,250), muted = CYD_RGB(145,161,182), teal = CYD_RGB(64,218,190);
+    const char *const names[] = {"Analog Video", "Digital Video", "Control Links", "Remote ID"};
+    const char *const phases[] = {"Sweeping analog video", "Checking digital activity",
+                                  "Sweeping control links", "Listening for Remote ID"};
+    const scout_bg_label_t heading[] = {
+        {16,9,"FPV Scout",white,CYD_FONT_TITLE},
+        {width-16-cyd_label_width(SCOUT_VERSION_LABEL,CYD_FONT_SMALL),14,SCOUT_VERSION_LABEL,muted,CYD_FONT_SMALL},
+        {16,35,phases[scout.all.phase],muted,CYD_FONT_SMALL},
+    };
+    char analog[24] = "", digital[40] = "", remote[28] = "";
+    const scout_rf_hit_t rf = scout.all.digital.shown;
+    if (scout.all.analog_at && now - scout.all.analog_at < SCOUT_ALL_ANALOG_AGE_US) {
+        const scout_channel_t ch = scout_channels[scout.all.analog_channel];
+        snprintf(analog,sizeof(analog),"%s / %u MHz",ch.name,ch.mhz);
+    }
+    if (rf.kind && rf.mhz) {
+        const char *label = rf.kind == SCOUT_RF_O4 ? "Likely DJI O4" :
+                            rf.kind == SCOUT_RF_AVATAR ? "Likely Avatar" : "Digital signal";
+        snprintf(digital,sizeof(digital),"%s / %u MHz",label,rf.mhz);
+    }
+    const bool elrs = scout.control.elrs_hops >= 2 && now - scout.control.elrs_at < 8000000;
+    const bool dji = scout.control.dji_matches >= 2 && now - scout.control.dji_at < 8000000;
+    const unsigned remote_count = scout_rid_recent(now);
+    if (remote_count) snprintf(remote,sizeof(remote),"%u recent %s",remote_count,remote_count == 1 ? "report" : "reports");
+    const char *const results[] = {analog, digital,
+        elrs && dji ? "ELRS and DJI-like activity" : elrs ? "Likely ELRS" : dji ? "DJI-like activity" : "",
+        remote};
+    const bool buffered = cyd_frame_begin();
+    scout_background(0,height,bg,heading,sizeof(heading)/sizeof(heading[0]));
+    for (unsigned i = 0; i < sizeof(names)/sizeof(names[0]); ++i) {
+        const int y = SCOUT_ALL_ROW_Y + (int)i * SCOUT_ALL_ROW_PITCH(landscape);
+        const bool detected = results[i][0] != '\0';
+        const scout_bg_label_t labels[] = {
+            {28,y+2,names[i],white,CYD_FONT_UI},
+            {28,y+(landscape ? 17 : 23),detected ? results[i] : "No recent detection",detected ? teal : muted,CYD_FONT_SMALL},
+            {width-38,y+(landscape ? 7 : 13),">",white,CYD_FONT_UI},
+        };
+        scout_pill(16,y,width-32,SCOUT_ALL_ROW_H(landscape),card,labels,sizeof(labels)/sizeof(labels[0]));
+    }
+    const char *const tools[] = {"Spectrum", "Settings", "Signal Log", "Composite"};
+    const int w = width / 2 - 22, h = SCOUT_MENU_TOOL_H(landscape);
+    for (unsigned i = 0; i < sizeof(tools)/sizeof(tools[0]); ++i) {
+        const int x = i % 2 ? width / 2 + 6 : 16;
+        const int y = SCOUT_MENU_TOOL_Y(landscape) + (int)(i / 2) * SCOUT_MENU_TOOL_PITCH(landscape);
+        scout_round(x,y,w,h,6,button);
+        const int text_x = x + (w-cyd_label_width(tools[i],CYD_FONT_SMALL))/2;
+        cyd_label(text_x,y+(h-12)/2,tools[i],white,button,CYD_FONT_SMALL);
+    }
     if (buffered) cyd_frame_end(0,0);
     scout.last_draw = now;
     scout.dirty = false;
@@ -1362,7 +1769,7 @@ static void cyd_ui_init(void) {
     if (cyd_init_with_bus_hook(cyd_wallpaper_init) != ESP_OK) return;
     esp_err_t led_error=cyd_indicator_init();
     if(led_error!=ESP_OK)printf("SCOUT LED init failed: %d\n",(int)led_error);
-    const char *title = "FPV Scout", *subtitle = "Analog video scanner";
+    const char *title = "FPV Scout", *subtitle = "RF receiver";
     cyd_label((cyd_width()-cyd_label_width(title,CYD_FONT_TITLE))/2,cyd_height()/2-57,
               title,CYD_RGB(238,243,250),CYD_BLACK,CYD_FONT_TITLE);
     cyd_label((cyd_width()-cyd_label_width(subtitle,CYD_FONT_SMALL))/2,cyd_height()/2-24,
@@ -1377,13 +1784,17 @@ static void cyd_ui_init(void) {
     scout_video_init();
     scout_log_load();
     scout_load_rescan();
-    scout_open_page(SCOUT_SCAN_PAGE);
+    scout_load_start_page();
+    scout_open_page(scout_start_pages[scout.start_page].page);
     scout.up = true;
 }
 static void cyd_ui_host_command(const char *line) {
     (void)line;
     if (!scout.up || scout.host) return;
-    if (scout.page == SCOUT_REMOTE_ID) scout_rid_stop();
+    if (scout.page == SCOUT_REMOTE_ID || scout.page == SCOUT_MENU || scout.page == SCOUT_SIGNAL_CAL) scout_rid_stop();
+    if (scout.page == SCOUT_SIGNAL_CAL &&
+        (scout.cal.stage == SCOUT_CAL_CHECK || scout.cal.stage == SCOUT_CAL_BASELINE))
+        scout.cal.stage = scout.cal.baseline_ready ? SCOUT_CAL_READY : SCOUT_CAL_SETUP;
     cyd_indicator_rate(0);
     scout.host = true;
     scout.video_full_state = 0;
@@ -1396,6 +1807,41 @@ static void cyd_ui_host_command(const char *line) {
 /* Read-only diagnostics do not interrupt scanning or take the host lease. */
 static bool cyd_ui_command(const char *line) {
 #ifdef SCOUT_VIDEO_PROBE
+    if (!strcmp(line, "SCOUT ALL OPEN")) {
+        scout_open_page(SCOUT_MENU);
+        reply("OK\n");
+        return true;
+    }
+    unsigned all_row;
+    char trailing;
+    if (!strcmp(line, "SCOUT CAL OPEN")) {
+        scout_open_page(SCOUT_SETTINGS);
+        scout_navigation_action(scout_navigation(SCOUT_SETTINGS,cyd_width()/2,SCOUT_SIGNAL_CAL_Y+8,cyd_landscape()));
+        reply("OK\n");
+        return true;
+    }
+    unsigned cal_tool;
+    if (scout.page == SCOUT_SIGNAL_CAL && scout.cal.tool == SCOUT_CAL_MENU &&
+        sscanf(line, "SCOUT CAL TOOL %u %c", &cal_tool, &trailing) == 1 &&
+        cal_tool >= SCOUT_CAL_ANALOG && cal_tool <= SCOUT_CAL_RID) {
+        scout_cal_input(cyd_width()/2,SCOUT_CAL_ROW_Y+(int)(cal_tool-SCOUT_CAL_ANALOG)*SCOUT_CAL_ROW_PITCH+8);
+        reply("OK\n");
+        return true;
+    }
+    if (scout.page == SCOUT_SIGNAL_CAL && (!strcmp(line, "SCOUT CAL ACTION") || !strcmp(line, "SCOUT CAL BACK"))) {
+        if (!strcmp(line, "SCOUT CAL BACK")) scout_cal_input(30,20);
+        else scout_cal_input(cyd_width()/2,SCOUT_BUTTON_Y+8);
+        reply("OK\n");
+        return true;
+    }
+    if (scout.page == SCOUT_MENU && sscanf(line, "SCOUT ALL ROW %u %c", &all_row, &trailing) == 1 &&
+        all_row <= SCOUT_ALL_RID) {
+        const bool landscape = cyd_landscape();
+        const int y = SCOUT_ALL_ROW_Y + (int)all_row * SCOUT_ALL_ROW_PITCH(landscape) + 6;
+        scout_navigation_action(scout_navigation(SCOUT_MENU,cyd_width()/2,y,landscape));
+        reply("OK\n");
+        return true;
+    }
     if (!strcmp(line, "SCOUT VIDEO FULL") && scout.page == SCOUT_SCAN_PAGE && (scout.video_full || scout.video_live)) {
         scout_toggle_fullscreen();
         reply("OK\n");
@@ -1439,6 +1885,12 @@ static bool cyd_ui_command(const char *line) {
             scout_start_auto(false);
             reply("OK\n");
         } else reply("ERR test_tune\n");
+        return true;
+    }
+    if (!strcmp(line, "SCOUT VIDEO RECHECK") && scout.page == SCOUT_SCAN_PAGE &&
+        scout.scan.mode == FPV_LOCK && !scout.manual && !scout.rechecking) {
+        scout_start_recheck(esp_timer_get_time());
+        reply("OK\n");
         return true;
     }
     unsigned test_mhz;
@@ -1516,6 +1968,28 @@ static bool cyd_ui_command(const char *line) {
         return true;
     }
     if (strcmp(line, "SCOUT?")) return false;
+    if (scout.page == SCOUT_SIGNAL_CAL) {
+        const scout_signal_cal_t *cal = &scout.cal;
+        char status[192];
+        snprintf(status,sizeof(status),"FPV_SCOUT " SCOUT_BUILD_VERSION " ready=%u mode=CAL tool=%u stage=%u baseline=%u signal=%u mhz=%u quality=%u saved=%u rx_errors=%u\n",
+                 scout.up,cal->tool,cal->stage,cal->baseline_ready,cal->result.signal,cal->result.mhz,
+                 cal->result.quality,cal->saved_valid,scout.capture_errors);
+        reply(status);
+        return true;
+    }
+    if (scout.page == SCOUT_MENU) {
+        static const char *const phases[] = {"ANALOG", "DIGITAL", "CONTROL", "REMOTEID"};
+        const int64_t now = esp_timer_get_time();
+        const bool analog = scout.all.analog_at && now - scout.all.analog_at < SCOUT_ALL_ANALOG_AGE_US;
+        char status[230];
+        snprintf(status,sizeof(status),"FPV_SCOUT " SCOUT_BUILD_VERSION " ready=%u mode=ALL phase=%s analog_mhz=%u digital_mhz=%u elrs_hops=%u ctrl_passes=%u remote_reports=%u passes=%u errors=%u heap=%u\n",
+                 scout.up,phases[scout.all.phase],analog ? scout_channels[scout.all.analog_channel].mhz : 0,
+                 scout.all.digital.shown.mhz,scout.control.elrs_hops,scout.control.passes,scout_rid_recent(now),
+                 scout.sweeps,scout.capture_errors,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        reply(status);
+        return true;
+    }
     if (scout.page == SCOUT_SIGNAL_LOG) {
         char status[92];
         snprintf(status,sizeof(status),"FPV_SCOUT " SCOUT_BUILD_VERSION " ready=%u mode=LOG entries=%u run=%lu first_run=%lu\n",
@@ -1550,7 +2024,7 @@ static bool cyd_ui_command(const char *line) {
     const int64_t now = esp_timer_get_time();
     if (scout.scan.mode == FPV_LOCK) scout_signal_labels(now, rssi, lq);
     const char *mode = scout.tuner_open ? "TUNE" : scout.page == SCOUT_SPECTRUM ? (scout.spectrum_held ? "HOLD" : "SPECTRUM") :
-        scout.comparing ? "COMPARE" : modes[scout.scan.mode];
+        scout.rechecking ? "RECHECK" : scout.comparing ? "COMPARE" : modes[scout.scan.mode];
     static const char *const rf_kinds[] = {"NONE", "UNKNOWN", "O4_LIKE", "AVATAR_LIKE"};
     const scout_rf_hit_t rf = scout.digital.shown;
     snprintf(status, sizeof(status), "FPV_SCOUT " SCOUT_BUILD_VERSION " ready=%u mode=%s freq=%u passes=%u pass_ms=%u captures=%u errors=%u heap=%u control=%s channel=%s rows=%u hsync=%u vsync=%u rescan=%s contenders=%u compare_ms=%u lock_ms=%u rssi=%s lq=%s rf=%s rf_mhz=%u rf_width_khz=%u sync_age_ms=%lld video_age_ms=%lld\n",
@@ -1599,10 +2073,12 @@ static void scout_detect_channel(void) {
     } else if (scout.scan.mode == FPV_VERIFY) {
         fpv_resume(&scout.scan);
     }
+    if (!scout.manual && before == FPV_VERIFY && scout.scan.mode == FPV_SCAN) scout_start_auto(false);
     if (before != scout.scan.mode) scout.dirty = true;
 }
 
 static void scout_scan_refresh(int64_t now) {
+    if (scout.page == SCOUT_MENU || scout.page == SCOUT_SIGNAL_CAL) return;
     const bool held = scout.scan.mode == FPV_HIT || scout.scan.mode == FPV_LOCK;
     /* Leave the tuner on the video channel while acquiring or recovering field sync. */
     const bool fresh_video = sv_v.tv_ok && sv_v.last_row_us && scout.scan.last_sync &&
@@ -1633,6 +2109,7 @@ static void scout_shortlist(fpv_evidence_t evidence) {
     if (evidence.h_pairs < 4 && evidence.v_pairs < 2) return;
     const int mhz = (int)scout_channels[scout.channel].mhz;
     if (abs(mhz - (int)scout.skipped_mhz) <= 10) return;
+    if (scout.rechecking && mhz == (int)scout_channels[scout.recheck_channel].mhz) return;
     for (unsigned i = 0; i < scout.candidate_count; i++)
         if (mhz == (int)scout_channels[scout.candidates[i].channel].mhz) return;
 
@@ -1651,7 +2128,76 @@ static void scout_shortlist(fpv_evidence_t evidence) {
     };
 }
 
+static void scout_complete_recheck(int winner, int64_t now) {
+    if (winner >= 0) {
+        const scout_candidate_t chosen = scout.candidates[winner];
+        printf("SCOUT recheck switched %u -> %u MHz\n",
+               scout_channels[scout.recheck_channel].mhz, scout_channels[chosen.channel].mhz);
+        scout_clear_signal();
+        scout.channel = chosen.channel;
+        scout.scan = chosen.sync;
+        scout_confirmed();
+    } else {
+        scout.channel = scout.recheck_channel;
+        scout.rechecking = scout.comparing = false;
+        scout.candidate_count = 0;
+        scout.tuned = false;
+        scout.next_check = 0;
+        scout.dirty = true;
+        printf("SCOUT recheck stayed %u MHz\n", scout_channels[scout.channel].mhz);
+    }
+    scout.recheck_after = now + SCOUT_RECHECK_COOLDOWN_US;
+}
+
+static unsigned scout_check_coverage(const scout_candidate_t *candidate) {
+    return 100 * candidate->valid_h / candidate->observations;
+}
+
+static unsigned scout_check_picture(const scout_candidate_t *candidate) {
+    return candidate->video_checks ? 256 * candidate->clean_lines / candidate->video_checks : 0;
+}
+
+static int scout_recheck_winner(void) {
+    const unsigned count = scout.candidate_count - 1;
+    const scout_candidate_t *current = &scout.candidates[count];
+    if (current->observations < SCOUT_RECHECK_MIN_CHECKS) return -1;
+    const unsigned current_coverage = scout_check_coverage(current);
+    const unsigned current_picture = scout_check_picture(current);
+    int best = -1;
+    unsigned best_coverage = 0, best_picture = 0;
+    for (unsigned i = 0; i < count; ++i) {
+        const scout_candidate_t *candidate = &scout.candidates[i];
+        if (candidate->sync.mode != FPV_HIT || candidate->observations < SCOUT_RECHECK_MIN_CHECKS)
+            continue;
+        const unsigned coverage = scout_check_coverage(candidate);
+        const unsigned picture = scout_check_picture(candidate);
+        const bool comparable_picture = current->video_checks >= SCOUT_COMPARE_VIDEO_MIN &&
+                                        candidate->video_checks >= SCOUT_COMPARE_VIDEO_MIN;
+        const bool steadier = coverage >= current_coverage + SCOUT_RECHECK_GAIN &&
+                              (!comparable_picture || picture + 128 >= current_picture);
+        const bool cleaner = comparable_picture && coverage + 5 >= current_coverage &&
+                             picture >= current_picture + 256;
+        if ((steadier || cleaner) && (best < 0 || coverage > best_coverage ||
+            (coverage == best_coverage && picture > best_picture))) {
+            best = (int)i;
+            best_coverage = coverage;
+            best_picture = picture;
+        }
+    }
+    /* The shortlist's RSSI order resolves equivalent improvements. */
+    return best;
+}
+
 static void scout_finish_comparison(int64_t now) {
+    if (scout.rechecking) {
+        scout.last_compared = scout.candidate_count;
+        scout.compare_us = now - scout.compare_start;
+        const int winner = scout_recheck_winner();
+        const int64_t last_sync = scout.candidates[scout.candidate_count - 1].sync.last_sync;
+        if (winner < 0 && last_sync > scout.scan.last_sync) scout.scan.last_sync = last_sync;
+        scout_complete_recheck(winner, now);
+        return;
+    }
     int best = -1;
     unsigned best_quality = 0;
     /* Candidates are already ordered by RF strength. Use it to break ties. */
@@ -1721,11 +2267,15 @@ static void scout_compare_step(int64_t now) {
     }
     fpv_evidence_t evidence;
     const bool captured = scout_read_evidence(&evidence);
+    if (scout.rechecking && !captured) return;
     fpv_observe(&candidate->sync, evidence, esp_timer_get_time());
     /* Expected vertical blanking windows carry little H evidence. */
     if (evidence.polarity != candidate->sync.polarity || evidence.v_pairs < 2 || evidence.h_pairs >= 4) {
         candidate->observations++;
-        if (evidence.polarity == candidate->sync.polarity) candidate->h_pairs += evidence.h_pairs;
+        if (evidence.polarity == candidate->sync.polarity) {
+            candidate->h_pairs += evidence.h_pairs;
+            if (evidence.h_pairs >= 4) candidate->valid_h++;
+        }
     }
     if (captured && now >= scout.compare_next_video && (evidence.v_pairs < 2 || evidence.h_pairs >= 4)) {
         scout.compare_next_video = now + SCOUT_COMPARE_VIDEO_US;
@@ -1736,14 +2286,14 @@ static void scout_compare_step(int64_t now) {
 }
 
 static void scout_sweep_step(int64_t now) {
-    if (!scout.channel) {
+    if (!scout.channel && !scout.rechecking) {
         if (scout.dirty) scout_scan_refresh(now);
         scout.sweep_start = now = esp_timer_get_time();
     }
     scout_tune();
     fpv_evidence_t evidence;
     if (scout_read_evidence(&evidence)) scout_shortlist(evidence);
-    if (now - scout.sweep_label_at >= 75000) {
+    if (scout.page == SCOUT_SCAN_PAGE && !scout.rechecking && now - scout.sweep_label_at >= 75000) {
         scout_draw_scan_channel(true);
         scout.sweep_label_at = now;
         if (now - scout.spectrum_tick >= 75000) scout_update_spectrum(now);
@@ -1756,12 +2306,22 @@ static void scout_sweep_step(int64_t now) {
     scout.sweep_us = now - scout.sweep_start;
     scout.channel = 0;
     scout.skipped_mhz = 0;
+    if (scout.rechecking) {
+        if (!scout.candidate_count) {
+            scout_complete_recheck(-1, now);
+            return;
+        }
+        scout.candidates[scout.candidate_count++] = (scout_candidate_t){
+            .channel = scout.recheck_channel,
+            .sync = {.mode=FPV_VERIFY, .polarity=scout.scan.polarity, .deadline=INT64_MAX},
+        };
+    }
     if (scout.candidate_count) {
         scout.comparing = true;
         scout.compare_index = scout.compare_round = 0;
         scout.channel = scout.candidates[0].channel;
         scout.dirty = true;
-        scout_draw(now);
+        if (scout.page == SCOUT_SCAN_PAGE) scout_draw(now);
         scout.compare_start = esp_timer_get_time();
     } else {
         scout.last_compared = 0;
@@ -1860,7 +2420,7 @@ static void scout_control_step(int64_t now) {
     if (had_elrs >= 2 && !c->elrs_hops) scout_log_lost(SCOUT_LOG_ELRS,0,now);
     if (had_dji >= 2 && !c->dji_matches) scout_log_lost(SCOUT_LOG_DJI_CONTROL,c->dji_mhz,now);
     bool updated = false;
-    if (now - scout.spectrum_tick >= 150000) {
+    if (scout.page == SCOUT_CONTROL && now - scout.spectrum_tick >= 150000) {
         updated = scout_update_spectrum(now);
     }
 #ifdef SCOUT_RUST_CORE
@@ -1868,8 +2428,177 @@ static void scout_control_step(int64_t now) {
 #endif
     if (c->elrs_hops >= 2 && c->elrs_at == now) scout_log_record(SCOUT_LOG_ELRS, 0, c->elrs.dbfs, now);
     if (c->dji_matches >= 2 && c->dji_at == now) scout_log_record(SCOUT_LOG_DJI_CONTROL, c->dji_mhz, c->dji.dbfs, now);
-    if (scout.dirty || updated || had_elrs != c->elrs_hops || had_dji != c->dji_matches)
+    if (scout.page == SCOUT_CONTROL && (scout.dirty || updated || had_elrs != c->elrs_hops || had_dji != c->dji_matches))
         scout_draw_control(updated);
+}
+
+static void scout_remote_id_step(int64_t now) {
+    const unsigned matches = scout_rid ? scout_rid->matches : 0;
+    const unsigned ble = scout_rid ? scout_rid->ble_matches : 0;
+    scout_rid_poll(now);
+    if (scout_rid && scout_rid->ble_matches != ble) {
+        scout_log_record(SCOUT_LOG_RID_BLE,0,scout_rid->latest_ble_rssi,now);
+        scout.rid_log_seen[1] = now;
+    }
+    if (scout_rid && scout_rid->matches - scout_rid->ble_matches != matches - ble) {
+        const unsigned ch = scout_rid->latest_wifi_channel;
+        const unsigned mhz = !ch ? 0 : ch < 14 ? 2407 + ch * 5 : ch == 14 ? 2484 : 5000 + ch * 5;
+        scout_log_record(SCOUT_LOG_RID_WIFI,mhz,scout_rid->latest_wifi_rssi,now);
+        scout.rid_log_seen[0] = now;
+    }
+    for (unsigned i = 0; i < 2; ++i) {
+        if (scout.rid_log_seen[i] && now - scout.rid_log_seen[i] >= SCOUT_RID_EXPIRY_US) {
+            scout_log_lost(SCOUT_LOG_RID_WIFI+i,0,now);
+            scout.rid_log_seen[i] = 0;
+        }
+    }
+}
+
+static bool scout_cal_check_reference(int64_t now) {
+    scout_signal_cal_t *cal = &scout.cal;
+    scout_cal_reference_t *r = &cal->result;
+    switch (cal->tool) {
+    case SCOUT_CAL_ANALOG:
+        if (scout.comparing) {
+            scout_compare_step(now);
+        } else if (scout.scan.mode != FPV_LOCK) {
+            scout_sweep_step(now);
+        } else {
+            if (!scout.tuned) scout_tune();
+            if (now >= cal->next_sample) {
+                scout_detect_channel();
+                cal->next_sample = now + 100000;
+            }
+            scout_video_capture();
+            const int lq = scout_lq();
+            if (scout.lq_samples == 16 && lq >= 75 && sv_v.tv_ok &&
+                sv_v.rows * 5 >= (unsigned)SCOUT_VIDEO_H * 4) {
+                r->mhz = scout_current_channel().mhz;
+                r->signal = sv_v.pal ? 1 : 2;
+                r->quality = lq;
+                r->level = 100 * sv_v.rows / SCOUT_VIDEO_H;
+                return true;
+            }
+        }
+        break;
+    case SCOUT_CAL_DIGITAL: {
+        scout_spectrum_step(now);
+        const scout_rf_hit_t hit = scout.digital.shown;
+        if (hit.kind && hit.mhz) {
+            r->signal = hit.kind;
+            r->mhz = hit.mhz;
+            r->level = hit.contrast > INT16_MAX ? INT16_MAX : hit.contrast;
+            return true;
+        }
+        break;
+    }
+    case SCOUT_CAL_CONTROL: {
+#ifdef SCOUT_RUST_CORE
+        scout_control_capture(now);
+#endif
+        const scout_control_t *c = &scout.control;
+        if (c->elrs_hops >= 2 || c->dji_matches >= 2) {
+            const bool elrs = c->elrs_hops >= 2;
+            const scout_control_reading_t *reading = elrs ? &c->elrs : &c->dji;
+            r->signal = elrs ? 1 : 2;
+            r->level = reading->dbfs;
+            r->quality = reading->quality;
+            return true;
+        }
+        break;
+    }
+    case SCOUT_CAL_RID:
+        scout_rid_poll(now);
+        if (scout_rid) {
+            if (scout_rid->matches > scout_rid->ble_matches) {
+                r->signal |= 1;
+                r->level = scout_rid->latest_wifi_rssi;
+            }
+            if (scout_rid->ble_matches) {
+                r->signal |= 2;
+                r->other_level = scout_rid->latest_ble_rssi;
+            }
+        }
+        return r->signal == 3;
+    }
+    return false;
+}
+
+static void scout_cal_step(int64_t now) {
+    scout_signal_cal_t *cal = &scout.cal;
+    const bool active = cal->stage == SCOUT_CAL_BASELINE || cal->stage == SCOUT_CAL_CHECK;
+    if (active && now >= cal->deadline) {
+        scout_cal_finish(cal->tool == SCOUT_CAL_RID && cal->result.signal);
+    } else if (cal->stage == SCOUT_CAL_BASELINE) {
+        if (!scout.spectrum_step) cal->baseline_error = false;
+        scout_spectrum_step(now);
+        if (!scout.spectrum_step && scout.spectrum_valid && !cal->baseline_error) {
+            if (cal->quiet_plot)
+                for (unsigned i = 0; i < SCOUT_SPEC_W; ++i)
+                    if (scout.spectrum_plot[i] > cal->quiet_plot[i]) cal->quiet_plot[i] = scout.spectrum_plot[i];
+            cal->baseline_total += scout.floor_est;
+            if (++cal->baseline_passes == 3) {
+                cal->baseline_ready = true;
+                cal->result.floor = cal->baseline_total / cal->baseline_passes;
+                cal->stage = SCOUT_CAL_READY;
+                scout.dirty = true;
+            }
+        }
+    } else if (cal->stage == SCOUT_CAL_CHECK && scout_cal_check_reference(now)) {
+        scout_cal_finish(true);
+    }
+    if (scout.dirty || (active && now - scout.last_draw >= 300000)) scout_draw_calibration(now);
+}
+
+/* Take turns on the same PHY. The normal scanner pages run their own routines. */
+static void scout_all_step(int64_t now) {
+    scout_all_t *all = &scout.all;
+    const unsigned previous_phase = all->phase;
+    switch (all->phase) {
+    case SCOUT_ALL_ANALOG: {
+        if (scout.comparing) {
+            scout_compare_step(now);
+            if (scout.comparing) break;
+        } else {
+            const unsigned sweeps = scout.sweeps;
+            scout_sweep_step(now);
+            if (scout.sweeps == sweeps || scout.comparing) break;
+        }
+        if (scout.scan.mode == FPV_LOCK) {
+            all->analog_channel = scout.channel;
+            all->analog_polarity = scout.scan.polarity;
+            all->analog_at = now;
+        }
+        scout.spectrum_step = 0;
+        all->phase = SCOUT_ALL_DIGITAL;
+        break;
+    }
+    case SCOUT_ALL_DIGITAL:
+        scout_spectrum_step(now);
+        if (!scout.spectrum_step) all->phase = SCOUT_ALL_CONTROL;
+        break;
+    case SCOUT_ALL_CONTROL:
+        scout_control_step(now);
+#ifdef SCOUT_RUST_CORE
+        if (scout.control.step) break;
+#endif
+        scout_rid_start();
+        all->rid_until = esp_timer_get_time() + SCOUT_ALL_RID_US;
+        all->phase = SCOUT_ALL_RID;
+        break;
+    case SCOUT_ALL_RID:
+        if (now >= all->rid_until) {
+            scout_rid_suspend();
+            scout_start_auto(false);
+            all->phase = SCOUT_ALL_ANALOG;
+        } else {
+            const unsigned reports = scout_rid_recent(scout.last_draw);
+            scout_remote_id_step(now);
+            if (scout_rid_recent(now) != reports) scout.dirty = true;
+        }
+        break;
+    }
+    if (scout.dirty || previous_phase != all->phase) scout_draw_all(now);
 }
 
 static void cyd_ui_step(void) {
@@ -1877,6 +2606,7 @@ static void cyd_ui_step(void) {
     int64_t now = esp_timer_get_time();
     if (scout.host) {
         scout.host = false;
+        if (scout.rechecking) scout_complete_recheck(-1, now);
         scout.tuned = false;
         scout.next_check = 0;
         scout.dirty = true;
@@ -1892,6 +2622,7 @@ static void cyd_ui_step(void) {
             scout.rid_log_seen[0] = scout.rid_log_seen[1] = 0;
             scout_rid_start();
         }
+        if (scout.page == SCOUT_MENU) scout_open_page(SCOUT_MENU);
         if (scout.page == SCOUT_SCAN_PAGE && !scout.manual && scout.scan.mode == FPV_SCAN)
             scout_start_auto(false);
     }
@@ -1919,27 +2650,17 @@ static void cyd_ui_step(void) {
         scout_control_step(now);
         return;
     }
+    if (scout.page == SCOUT_MENU) {
+        scout_all_step(now);
+        return;
+    }
     if (scout.page == SCOUT_REMOTE_ID) {
-        const unsigned matches = scout_rid ? scout_rid->matches : 0;
-        const unsigned ble = scout_rid ? scout_rid->ble_matches : 0;
-        scout_rid_poll(now);
-        if (scout_rid && scout_rid->ble_matches != ble) {
-            scout_log_record(SCOUT_LOG_RID_BLE,0,scout_rid->latest_ble_rssi,now);
-            scout.rid_log_seen[1] = now;
-        }
-        if (scout_rid && scout_rid->matches - scout_rid->ble_matches != matches - ble) {
-            const unsigned ch = scout_rid->latest_wifi_channel;
-            const unsigned mhz = !ch ? 0 : ch < 14 ? 2407 + ch * 5 : ch == 14 ? 2484 : 5000 + ch * 5;
-            scout_log_record(SCOUT_LOG_RID_WIFI,mhz,scout_rid->latest_wifi_rssi,now);
-            scout.rid_log_seen[0] = now;
-        }
-        for (unsigned i=0; scout_rid && i<2; ++i) {
-            if (scout.rid_log_seen[i] && now - scout.rid_log_seen[i] >= SCOUT_RID_EXPIRY_US) {
-                scout_log_lost(SCOUT_LOG_RID_WIFI+i,0,now);
-                scout.rid_log_seen[i] = 0;
-            }
-        }
+        scout_remote_id_step(now);
         if (scout.dirty || now - scout.last_draw >= 500000) scout_draw_remote_id(now);
+        return;
+    }
+    if (scout.page == SCOUT_SIGNAL_CAL) {
+        scout_cal_step(now);
         return;
     }
     if (scout.page == SCOUT_SIGNAL_LOG) {
@@ -1948,13 +2669,17 @@ static void cyd_ui_step(void) {
     }
     if (scout.page!=SCOUT_SCAN_PAGE) {
         cyd_indicator_rate(0);
-        if (scout.dirty) {
-            if(scout.page==SCOUT_MENU) scout_draw_menu();
-            else scout_draw_settings();
-        }
+        if (scout.dirty) scout_draw_settings();
         return;
     }
     if (scout.scan_plot_dirty && !scout.dirty) scout_draw_scan_plot();
+    if (scout.rechecking) {
+        if (now - scout.sweep_start >= SCOUT_RECHECK_MAX_US) scout_complete_recheck(-1, now);
+        else if (scout.comparing) scout_compare_step(now);
+        else scout_sweep_step(now);
+        if (scout.dirty) scout_draw(now);
+        return;
+    }
     if (scout.comparing) {
         scout_compare_step(now);
         if (scout.dirty) scout_draw(now);
@@ -1965,6 +2690,10 @@ static void cyd_ui_step(void) {
         return;
     }
     if (scout.scan.mode == FPV_VERIFY && now >= scout.scan.deadline) {
+        if (!scout.manual) {
+            scout_start_auto(false);
+            return;
+        }
         fpv_resume(&scout.scan);
         scout.dirty = true;
     }
@@ -1995,6 +2724,11 @@ static void cyd_ui_step(void) {
         if (live != scout.video_live) scout.dirty = true;
         scout.video_live = live;
         scout.video_pal = sv_v.pal;
+        if (scout_recheck_due(now)) {
+            scout_start_recheck(now);
+            scout_draw(now);
+            return;
+        }
     }
     scout_scan_refresh(esp_timer_get_time());
 }

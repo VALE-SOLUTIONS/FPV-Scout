@@ -1,6 +1,6 @@
 # Build FPV Scout
 
-Use [ESP-IDF 6.0.2](https://github.com/espressif/esp-idf/tree/7101770dc6db2667b3c477cc31365dd1acd6db4e) at commit `7101770dc6db2667b3c477cc31365dd1acd6db4e`, with its recursive submodules and ESP32-C5 tools installed. The 1.17.0 release uses Rust 1.100.0 and Espressif's RISC-V GCC 15.2 toolchain (`esp-15.2.0_20251204`). Put Cargo on PATH in the activated ESP-IDF shell. CMake builds the core offline from the committed lockfile.
+Use [ESP-IDF 6.0.2](https://github.com/espressif/esp-idf/tree/7101770dc6db2667b3c477cc31365dd1acd6db4e) at commit `7101770dc6db2667b3c477cc31365dd1acd6db4e`, with its recursive submodules and ESP32-C5 tools installed. The 1.19.0 release uses Rust 1.100.0 and Espressif's RISC-V GCC 15.2 toolchain (`esp-15.2.0_20251204`). Put Cargo on PATH in the activated ESP-IDF shell. CMake builds the core offline from the committed lockfile.
 
 Run from the repository root in PowerShell.
 

@@ -2,7 +2,7 @@
 
 ## Signal Log
 
-Tap **Back** and then **Signal Log** in the upper-right corner of the main
+Tap **Back** and then **Signal Log** below the scanner cards on the main
 menu. Newest entries appear first. Tap **Older** or **Newer** when the log has
 multiple pages.
 
@@ -48,7 +48,7 @@ strip shows the tuned channel and progress through the 48 entries. The
 
 In **Settings**, tap **Orientation** to switch between Portrait and Landscape. The app saves the selection across restarts. Version 1.12.6 flips Landscape and maps saved landscape touch calibration to the new rotation. If that orientation has no saved touch calibration, tap and briefly hold each of the three crosses. **Calibrate touch** updates the calibration for the active orientation.
 
-The CYD boots directly into **SCAN** and sweeps the 48 A/B/E/F/R/L channel entries from 5362 to 5945 MHz. Tap **Back** to pause scanning and open the main menu. Choose **SCAN** from the menu to resume. F8 and R7 share 5880 MHz. These are predefined channel centers; frequencies between them and other RF bands are not continuously covered.
+The CYD opens the scanning **Main Menu** by default. **Settings → Start page** can open a dedicated scanner or another page instead. Tap **Analog Video** from the menu to open Video Link Scanner. A recent analog result starts verification on its channel before returning to the full Auto sweep if needed. Auto sweeps the 48 A/B/E/F/R/L entries from 5362 to 5945 MHz. F8 and R7 share 5880 MHz. These are predefined channel centers; frequencies between them and other RF bands are not continuously covered.
 
 ```mermaid
 stateDiagram-v2
@@ -64,6 +64,8 @@ The initial sweep takes one snapshot per channel using the ESPsoup register-leve
 The phase discriminator produces 0.5 microsecond bins and tests both modulation polarities. The initial sweep admits channels with four consecutive horizontal-sync intervals or two vertical-serration intervals. Confirmation requires three qualifying horizontal-sync snapshots and a qualifying vertical-sync snapshot with the same polarity. Manual allows 400 ms for confirmation. Auto collects evidence across the comparison visits.
 
 Auto shortlists up to three channels by centered in-band spectrum strength after checking all 48 entries. It visits each candidate twice for about 45 ms per visit and compares the average repeating horizontal-sync chain among candidates that also confirm vertical sync. Signal strength breaks ties. A confirmed contender within 6 MHz of the initial winner can take the lock if both have enough picture samples and the contender decodes at least one more clean row per snapshot on average. Nearby presets can receive the same broadcast, so the displayed preset may differ from the transmitter's setting. If none confirms, Auto sweeps again. **Continue** starts a full sweep and excludes candidates within 10 MHz of the previous hold from that sweep's ranking. **Auto scan** starts a sweep with every channel eligible.
+
+With **Auto rescan** enabled in Auto, a held channel with recent sync and LQ at or below 81% for at least 600 ms triggers **Rechecking**. Scout compares the held channel with up to three alternatives from a fresh signal-strength sweep. A challenger needs confirmed video and a clear improvement in sync coverage or clean picture rows. RSSI breaks equivalent results. Scout keeps the last picture visible during the check and waits at least ten seconds before another comparison. Manual tuning and the existing five-second sync-loss recovery follow their usual controls.
 
 Manual monitors the selected channel and opens the preview once sync is confirmed. **<** or **>** moves to the adjacent entry and clears the old picture. A hold uses qualifying horizontal sync from the detector or fresh video rows backed by horizontal sync from the same capture. After one second without sync the status reads **Recovering**, followed by **Sync lost** at three seconds. With **Settings → Auto rescan** on, five seconds without sync starts a fresh automatic sweep from either an Auto or Manual lock. Returning sync restarts the timer. Turn Auto rescan off to keep the receiver on the held frequency until you change it. The toggle is on by default and is saved across restarts. Press BOOT to start a fresh sweep from a hold.
 
@@ -170,6 +172,25 @@ relative levels, and the video receiver resumes when you return to **SCAN**.
 Live updates repaint the plots and changing readouts in place. The buttons
 stay visible during redraws, including when an animated wallpaper is enabled.
 
+## Signal calibration
+
+Open **Settings → Signal Calibration** and choose a tool. Each tool saves a
+separate bench reference. On later runs the tool shows the saved reference
+alongside the new readings.
+
+| Tool | Procedure |
+| --- | --- |
+| **Analog Video** | Turn off your test video source and tap **Measure baseline**. Power the source on and tap **Check signal**. Scout reads the detected frequency, PAL/NTSC timing, sync quality, and picture row coverage. |
+| **Digital Video** | Measure the quiet band with your video source off. Power it on, allow the link to connect, then tap **Check signal**. Scout looks for a repeatable rise of at least 6 dB over the quiet measurement and reports the estimated frequency and contrast. Unnamed matches show as **Unclassified RF** after a check for analog sync. |
+| **Control Links** | Measure the 2.4 GHz baseline with your test controller off. Turn one controller on and tap **Check signal**. Scout reports a likely ELRS or DJI-like match with receiver power and waveform quality. |
+| **Remote ID** | Power on your own beacon and tap **Listen**. Scout checks Wi-Fi and Bluetooth separately. Once the expected transport appears, tap **Use results** to review it. |
+
+For the first three tools the quiet reference is the average floor from three
+completed band sweeps, in relative receiver units. Review the measurement and
+tap **Save reference** to store it on the board. **Back** cancels a run. A saved
+reference belongs to the bench setup where it was measured, including antenna,
+position and nearby RF activity.
+
 ## SD card wallpaper
 
 Put PNG and GIF files in `/wallpapers` on a FAT32 or exFAT microSD card.
@@ -183,9 +204,9 @@ still work, with PNG taking priority.
 
 Tap the wallpaper mode button to cycle through the three saved modes.
 
-- **MAIN** shows the wallpaper on the main menu. This is the default.
-- **ALL** also shows it behind Settings, SCAN, Spectrum and Composite Bench. The graphs, controls and video previews remain in the foreground.
-- **OFF** hides the wallpaper. Select MAIN or ALL to show it again.
+- **Main** shows the wallpaper on the main menu. This is the default.
+- **All** also shows it behind Settings, SCAN, Spectrum and Composite Bench. The graphs, controls and video previews remain in the foreground.
+- **Off** hides the wallpaper. Select Main or All to show it again.
 
 Settings shows the last load result. Over USB, `WALLPAPER?` reads that result and `WALLPAPER RELOAD` retries from the main menu or Settings. An SD mount error means the CYD could not open the filesystem and has yet to read the image. Reload does not format the card.
 

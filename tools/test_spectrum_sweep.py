@@ -14,6 +14,7 @@ code='''#include <assert.h>
 #include "scout_spectrum.h"
 #include "scout_digital.h"
 #include "scout_signal_log.h"
+#include "scout_signal_cal.h"
 #include "fpv_scan.h"
 static unsigned frequency_mhz=5658,rx_channel_mode=20,prepares,captures;
 static int rx_analog_filter=77;
@@ -27,7 +28,8 @@ static const char *spec_compute(unsigned,unsigned,unsigned,int16_t*,uint32_t*);
 static const char *spec_compute(unsigned rate,unsigned fft,unsigned avg,int16_t *bins,uint32_t *us) {
     captures++;
     assert(rate==1 && fft==256 && avg==4);
-    const unsigned low=scout.spectrum_24 || scout.page==SCOUT_CONTROL ? SCOUT_BAND_24_LOW:SCOUT_BAND_LOW;
+    const bool cal24=scout.page==SCOUT_SIGNAL_CAL && scout.cal.tool==SCOUT_CAL_CONTROL;
+    const unsigned low=scout.spectrum_24 || scout.page==SCOUT_CONTROL || cal24 ? SCOUT_BAND_24_LOW:SCOUT_BAND_LOW;
     assert(frequency_mhz==low+15+scout.spectrum_step*30);
     assert(rx_channel_mode==40 && rx_analog_filter==140 && rx_ready);
     for(unsigned j=0;j<256;j++)bins[j]=-3000;
@@ -68,6 +70,13 @@ int main(void) {
     scout.spectrum_step=SCOUT_SWEEP_STEPS-1;
     scout_spectrum_step(4000000);
     assert(scout_log.entries[0].seen_seconds==3);
+    memset(&scout,0,sizeof(scout));
+    scout.page=SCOUT_SIGNAL_CAL;
+    scout.cal.tool=SCOUT_CAL_CONTROL;
+    fail_all=true;
+    for(unsigned step=0;step<3;step++)scout_spectrum_step(5000000+step*20000);
+    assert(scout.cal.baseline_error && !scout.spectrum_valid && !scout.spectrum_step);
+    assert(frequency_mhz==5658 && rx_channel_mode==20 && rx_analog_filter==77 && rx_ready);
     puts("PASS: both RF bands, complete 2.4 GHz coverage, receive settings restored on success/error, missing-data handling");
 }
 '''

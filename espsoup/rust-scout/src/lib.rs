@@ -123,12 +123,18 @@ pub extern "C" fn rust_scout_navigation(page: u32, x: i32, y: i32, landscape: bo
     if !(0..w).contains(&x) || !(0..h).contains(&y) { return 0; }
     let card = (16..w - 16).contains(&x);
     if page == 0 {
-        if (w - 112..w - 12).contains(&x) && (8..36).contains(&y) { return 19; }
         if !card { return 0; }
-        let (start, stride, height) = if landscape { (47, 29, 25) } else { (65, 39, 34) };
-        let row = y - start;
-        if (0..6 * stride).contains(&row) && row % stride < height {
-            return [2, 17, 15, 3, 18, 8][(row / stride) as usize];
+        let (stride, height, tool_y, tool_height) = if landscape { (34, 30, 192, 20) } else { (52, 46, 264, 24) };
+        let row = y - 55;
+        if (0..4 * stride).contains(&row) && row % stride < height {
+            return [20, 22, 17, 18][(row / stride) as usize];
+        }
+        let tool = y - tool_y;
+        let tool_stride = tool_height + 4;
+        if (0..2 * tool_stride).contains(&tool) && tool % tool_stride < tool_height {
+            let second = tool >= tool_stride;
+            if x < w / 2 - 6 { return if second { 19 } else { 15 }; }
+            if x >= w / 2 + 6 { return if second { 8 } else { 3 }; }
         }
     } else {
         if (8..66).contains(&x) && (6..34).contains(&y) { return 1; }
@@ -136,17 +142,20 @@ pub extern "C" fn rust_scout_navigation(page: u32, x: i32, y: i32, landscape: bo
             return 16;
         }
         if page == 2 && card {
-            if (44..80).contains(&y) { return 14; }
-            if (86..122).contains(&y) { return 9; }
-            if (150..186).contains(&y) {
+            if (!landscape && (270..302).contains(&y)) ||
+               (landscape && x >= w / 2 + 6 && (44..76).contains(&y)) { return 21; }
+            if (44..76).contains(&y) && (!landscape || x < w / 2 - 6) { return 14; }
+            if (82..114).contains(&y) { return 9; }
+            if (118..150).contains(&y) { return 23; }
+            if (154..186).contains(&y) {
                 if x < w / 2 - 6 { return 11; }
                 if x >= w / 2 + 6 { return 10; }
             }
-            if (190..226).contains(&y) {
+            if (190..222).contains(&y) {
                 if !landscape || x < w / 2 - 6 { return 4; }
                 if x >= w / 2 + 6 { return 7; }
             }
-            if !landscape && (232..268).contains(&y) { return 7; }
+            if !landscape && (232..264).contains(&y) { return 7; }
         }
         if (page == 1 || page == 3 || page == 4 || page == 7) && (h - 36..h - 4).contains(&y) {
             if (12..w / 2 - 6).contains(&x) { return 5; }

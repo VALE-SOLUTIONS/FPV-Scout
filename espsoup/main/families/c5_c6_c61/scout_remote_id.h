@@ -25,6 +25,15 @@ typedef struct {
 /* Static data must stay below the RF capture bank. */
 static scout_rid_state_t *scout_rid;
 
+static unsigned scout_rid_recent(int64_t now) {
+    unsigned count = 0;
+    for (unsigned i = 0; scout_rid && i < SCOUT_RID_CAPACITY; ++i) {
+        const int64_t seen = scout_rid->aircraft[i].seen;
+        if (seen && now - seen < SCOUT_RID_EXPIRY_US) ++count;
+    }
+    return count;
+}
+
 #ifdef SCOUT_RUST_CORE
 #include "freertos/queue.h"
 #include <stdatomic.h>
@@ -134,7 +143,7 @@ static void scout_rid_wifi_receive(void *buf, wifi_promiscuous_pkt_type_t type) 
     (void)xQueueSend(scout_rid_inbox, &packet, 0);
 }
 
-static void scout_rid_stop(void) {
+static void scout_rid_suspend(void) {
     if (scout_rid_wifi_saved) {
         (void)esp_wifi_set_promiscuous(false);
         if (scout_rid && scout_rid->ble_enabled) scout_rid_ble_close();
@@ -145,12 +154,18 @@ static void scout_rid_stop(void) {
         scout_rid_wifi_saved = false;
         rx_ready = false;
     }
+}
+
+static void scout_rid_stop(void) {
+    scout_rid_suspend();
     free(scout_rid);
     scout_rid = NULL;
 }
 
 static void scout_rid_start(void) {
-    scout_rid = heap_caps_calloc(1, sizeof(*scout_rid), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (scout_rid_wifi_saved) return;
+    if (!scout_rid)
+        scout_rid = heap_caps_calloc(1, sizeof(*scout_rid), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!scout_rid) return;
     if (!scout_rid_inbox) scout_rid_inbox = xQueueCreate(12, sizeof(scout_rid_packet_t));
     if (!scout_rid_inbox || esp_wifi_get_promiscuous_filter(&scout_rid_saved_filter) ||
@@ -170,6 +185,8 @@ static void scout_rid_start(void) {
         return;
     }
     scout_rid->ble_enabled = scout_rid_ble_init();
+    scout_rid->ble_window = false;
+    scout_rid->channel_until = 0;
     scout_rid->window_until = esp_timer_get_time() + 2000000;
 }
 
@@ -240,6 +257,7 @@ static unsigned scout_rid_frames(void) {
 }
 #else
 static void scout_rid_start(void) {}
+static void scout_rid_suspend(void) {}
 static void scout_rid_stop(void) {}
 static void scout_rid_poll(int64_t now) { (void)now; }
 static unsigned scout_rid_frames(void) { return 0; }

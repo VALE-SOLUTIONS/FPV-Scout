@@ -1,5 +1,26 @@
 # FPV Scout hardware validation
 
+## 1.19.0 scanning main menu and signal calibration
+
+- The standard application was write-verified on the RockBase CYD. The
+  release app and checked-in build output matched byte for byte. The stock
+  installer partition table matched the verified layout. Bootloader differences
+  in the build output were limited to build time and image integrity metadata.
+- The CYD completed analog calibration on a live 5771 MHz NTSC bench feed.
+  The bench check covered the menu's radio handoff and verified that sweeps resumed
+  after exiting calibration with zero reported capture errors.
+- A revised digital calibration check rejected the persistent analog bench
+  feed from the quiet measurement. Positive digital, control link and
+  Remote ID calibration results were exercised with host fixtures. Live
+  positive calibration tests for those three tools remain open.
+- Host tests cover saved calibration references, failed saves, quiet-baseline
+  retries, selecting a startup page, scanner handoff, and keeping or changing
+  the channel when analog LQ drops. The 1.18.1 bench runs completed forced
+  analog rechecks in 0.46–0.75 seconds and kept the last picture visible.
+- The release HTML opened in Chrome from disk and made zero HTTP requests.
+  Simulated serial tests covered board checks, backup, write verification and
+  recovery after a write failure.
+
 ## 1.17.0 persistent Signal Log and fullscreen
 
 - A live analog entry survived a CYD restart. The board exported the entry to
